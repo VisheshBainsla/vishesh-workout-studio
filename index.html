@@ -7,6 +7,10 @@
   <meta name="color-scheme" content="dark">
   <meta name="description" content="Vishesh Workout Studio - a private, offline-friendly workout tracker. All data stays on your device.">
   <title>Vishesh Workout Studio</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" type="image/png" href="icon-192.png">
+  <link rel="apple-touch-icon" href="icon-192.png">
+  <meta name="mobile-web-app-capable" content="yes">
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -40,10 +44,17 @@
     </div>
   </div>
 
+  <div id="update-banner" class="update-banner" hidden>
+    <span>A new version of the app is ready.</span>
+    <button class="btn btn-primary btn-sm" data-action="applyUpdate">Update now</button>
+    <button class="btn btn-ghost btn-sm" data-action="dismissUpdate">Later</button>
+  </div>
+
   <div id="toast" role="status" aria-live="polite"></div>
 
   <!-- Hidden file pickers (kept outside the views so re-rendering never destroys them) -->
   <input type="file" id="audio-input" accept="audio/*,.mp3,.m4a,.aac,.wav,.ogg,.opus,.flac" multiple hidden>
+  <input type="file" id="video-input" class="native-file-picker" accept="video/mp4,video/webm,video/*,.mp4,.m4v,.webm,.mov,.3gp,.mkv,.ogv" aria-label="Choose a video file" style="position:fixed;left:-10000px;top:0;width:1px;height:1px;opacity:0;pointer-events:none">
   <input type="file" id="import-input" accept="application/json,.json" hidden>
 
   <script src="core.js"></script>
