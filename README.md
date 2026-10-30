@@ -1,45 +1,80 @@
 # Vishesh Workout Studio
 
-A private, mobile-first workout website. Pure HTML, CSS and JavaScript: no backend, no accounts, no API keys, no paid services.
+A private, mobile-first workout website. Plain HTML, CSS and JavaScript: no backend, no accounts, no API keys, no paid services.
 
-## Files
+## Files (put all of them in the top level of your GitHub repository)
 
-| File | Purpose |
-|---|---|
-| `index.html` | Page shell (open this) |
-| `styles.css` | Black and red theme |
-| `core.js` | Logic: YouTube link parsing, stopwatch maths, streaks, stats, backup validation |
-| `app.js` | The interface and storage |
+| File | Status in this update | Purpose |
+|---|---|---|
+| `index.html` | modified | Page shell |
+| `styles.css` | modified | Black and red theme |
+| `core.js` | modified | Logic: timer, streaks, link and video-file checks, backup validation |
+| `app.js` | modified | The interface and storage |
+| `sw.js` | **new** | Service worker: lets the app open offline |
+| `manifest.webmanifest` | **new** | Lets you install the app to your Home screen |
+| `icon-192.png`, `icon-512.png`, `icon-maskable-512.png` | **new** | App icons |
+| `test-core.js` | modified | Optional: logic tests (`node test-core.js`). Not needed on GitHub |
+| `README.md` | modified | This file |
 
-## Put it on GitHub Pages (free)
+## Replace the files using only your Android phone
 
-1. Create a new public repository on GitHub.
-2. Upload all four files to the top level of the repository (not inside a folder).
-3. Repository **Settings → Pages → Build and deployment**: Source = *Deploy from a branch*, Branch = `main`, folder = `/ (root)`. Save.
-4. After a minute, open `https://<your-username>.github.io/<repo-name>/` on your phone.
-5. In Chrome on Android: menu (⋮) → **Add to Home screen**.
+1. Open github.com in Chrome and sign in. Open your repository (the one that holds the site).
+2. Tap **Add file → Upload files** (if you only see a "+" icon, tap it and choose **Upload files**).
+3. Pick all the files from the table above (the 4 modified site files and the 6 new ones). Files with the same name are replaced.
+4. Scroll down, tap **Commit changes**.
+5. Wait about a minute, then open your site address (`https://<you>.github.io/<repo>/`). Reload twice.
 
-Open it through that `https://` address. YouTube embeds can refuse to play when `index.html` is opened directly from a file (`file://`). The "Open in YouTube" button still works there.
+All paths are relative (`./`), so it works from your repository sub-folder address.
 
-## Where your data lives
+## Your existing data is kept
 
-| Data | Where |
-|---|---|
-| Workouts, history, rest days, weights, playlist | IndexedDB in your browser |
-| Song files (optional, "Keep a copy" switch) | IndexedDB in your browser |
-| Daily goal, shuffle/repeat, active tab, a running session | localStorage (small settings only) |
+Workouts, history, rest days, weights and the playlist stay in the same browser database; it is upgraded in place (version 1 to 2) and new storage areas are added. A session that was running in the old version is restored **paused**.
 
-Nothing is ever uploaded. Browser data can be erased (clearing site data, uninstalling the browser, storage cleaners, private mode), so **it is not a guaranteed backup**. Use **Settings (top right) → Export backup** regularly and keep the JSON file somewhere safe (Drive, email to yourself). Backups do not contain song files, only the playlist names.
+## Feature 1: manual timer
 
-## What cannot work perfectly in a mobile browser
+- Opening a workout shows **00:00** and **TIMER NOT STARTED**. Nothing starts it: not loading or playing the video, reloading, or switching tabs.
+- Big **START TIMER** button. While running it becomes **PAUSE**; when paused it becomes **RESUME**.
+- **RESET TO 0** stops the timer and returns to 00:00. If there is recorded time, it asks for confirmation first. Nothing is added to history.
+- **FINISH WORKOUT** stops the timer and asks you to confirm. Only active time is saved. Paused time is never counted.
+- Finishing without ever starting the timer saves nothing; it tells you why and lets you go back or discard.
+- Tapping Finish or Save repeatedly saves exactly one history entry.
+- The clock uses timestamps, so it stays correct while the screen is locked or Chrome is in the background.
+- If the page reloads or Chrome closes the tab while the timer is running, it comes back **paused** at the last moment the app was alive (checked every 5 s and when the page is hidden). It never counts the time you were away. Tap RESUME on purpose.
 
-- **Local music is not remembered by file path.** Browsers do not allow that. The app stores a copy of the songs in browser storage when it can. If the browser clears it or storage is full, songs show "reselect file". Tap *Add / reselect songs* and pick the same files; they are matched by name and size.
-- **YouTube playback cannot be fully controlled.** Some videos block embedding. The app uses YouTube's player API to detect this and highlights an "Open in YouTube" button, but only when the API loads (internet needed). Ads and recommendations are YouTube's, not ours. The app does not know how much of a video you actually watched; you confirm completion yourself.
-- **Stopwatch and screen lock.** The timer is based on timestamps, so it stays accurate when the screen sleeps or the browser throttles the page. The screen is kept awake during a session where the browser supports the Wake Lock feature (Chrome on Android does). If the browser kills the tab while the timer was running, the session is restored paused at the last moment the app saw it (within about 5 seconds), because the app cannot know whether you kept training.
-- **Music in the background** usually continues with the screen off in Chrome on Android and shows lock-screen controls, but this is up to the browser and the phone's battery settings.
-- **No offline install yet.** There is no service worker. After the first visit the app needs the internet to load again, and YouTube needs it anyway.
-- **Downloads** go to your phone's Downloads folder; importing means picking that file again.
+## Feature 2: import your own videos
 
-## Streak rules
+1. Open **Workouts → My Videos → Import Video**. Android's file picker opens.
+2. Choose an MP4 or WebM (MOV, 3GP and MKV are tried too). Chrome first checks it can really play it. AVI, WMV and similar are refused with an explanation.
+3. Edit the title, optionally set a category, tap **Import video**.
+4. Wait for the green **Saved and verified** message. The app copies the video into the browser's database in 8 MB pieces, reads every piece back and checks it (size and SHA-256 fingerprint) before showing success. Keep the screen on and do not leave the page while it runs.
+5. Only after that message, the original can be deleted or moved. The saved copy does not use its path.
+6. Play it from My Videos. You can also rename, delete (with confirmation), **Use in workout** (creates a workout that plays this video, and the timer stays manual), or **Save copy** (downloads the video file back to your phone as a backup).
+7. When adding or editing a workout, choose **Saved video** instead of a YouTube link. YouTube workouts work exactly as before.
 
-A day counts when you save at least one completed session. A rest day does not break the streak but does not add to it either. Today without a workout does not break the streak until the day ends.
+If an import fails (no space, file moved, Chrome closed), nothing is saved, the partial copy is removed (also on next start if Chrome was killed), and your other videos are untouched.
+
+## Offline use on Android
+
+1. Open the site once **while online** in Chrome. This saves the app itself. Settings (top right) shows "Offline: the app itself is saved on this phone".
+2. Optional but recommended: Chrome menu (⋮) → **Add to Home screen / Install app**. Installed apps are more likely to be granted protected storage.
+3. Later, with airplane mode on, open the site or the Home-screen icon. The app and your imported videos work. YouTube workouts and thumbnails need internet.
+
+When you publish a new version, change `VERSION` in `sw.js`. Users see an **Update now** banner. The old version keeps working until they tap it, and a running timer is kept paused.
+
+## Storage limits: please read
+
+- Everything stays on this phone. Nothing is uploaded.
+- Videos live in Chrome's site storage. **Clearing Chrome's site data, resetting or uninstalling Chrome, or Chrome freeing space can delete them.** Protected storage is requested on your first import, and the result is shown, but it is not guaranteed.
+- The quota depends on your phone's free space. The app shows usage and the estimated quota (an estimate, not a promise). If space runs out the import stops with a clear message and nothing already saved is touched.
+- **JSON backups do not contain video files or song files**, only their names and details (the Settings screen says so). Use **Save copy** on each video for a real backup. After restoring a JSON backup, videos show "File not on this phone"; import the same file again and it reconnects to the same record.
+- Do not rely on this app as your only copy of an important video.
+
+## Other features (unchanged)
+
+Dashboard, YouTube library and player, session history, tracker with calendar, streaks and rest days, weight chart, local music player, export and import of workout data.
+
+## What cannot be guaranteed in a mobile browser
+
+- Playback of unusual codecs (some phone videos use H.265/HEVC); the app tests playability before importing.
+- Music files are not remembered by path; the app keeps a copy when it can, otherwise you reselect them.
+- Background timers can be frozen by Android; the timer stays accurate because it uses timestamps.
