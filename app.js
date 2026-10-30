@@ -1244,7 +1244,20 @@
     openSettings: openSettings,
     closeSheet: () => { if (Imp.running) { toast('Import in progress. Tap “Cancel import” to stop it.'); return; } closeSheet(); },
     wSub: d => { ui.wSub = d.sub === 'videos' ? 'videos' : 'workouts'; renderWorkouts(); },
-    importVideo: () => { if (Imp.running) { toast('An import is already running'); return; } $('#video-input').click(); },
+    importVideo: () => {
+      if (Imp.running) { toast('An import is already running'); return; }
+      const input = $('#video-input');
+      if (!input) { toast('Video picker is missing. Reload the app and try again.'); return; }
+      // Must be invoked synchronously from the user's tap so Android Chrome keeps user activation.
+      try {
+        if (typeof input.showPicker === 'function') input.showPicker();
+        else input.click();
+      } catch (err) {
+        // showPicker can be unsupported or rejected by a browser; fall back to the native click.
+        try { input.click(); }
+        catch (err2) { console.error('Could not open video picker', err, err2); toast('Could not open the video picker. Reload the page and try again.'); }
+      }
+    },
     cancelImport: cancelImport,
     playVideo: d => playVideo(d.id),
     renameVideo: d => renameVideoSheet(d.id),
