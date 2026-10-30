@@ -110,17 +110,27 @@
   function thumbUrl(p) { return p.id ? 'https://i.ytimg.com/vi/' + p.id + '/mqdefault.jpg' : null; }
 
   /* ---------------- workout session stopwatch ----------------
-   * A session never counts paused time:
+   * The timer is MANUAL: a new session starts "idle" at 00:00 and only counts after startTimer().
    *   elapsed = accumMs (time banked before the last resume) + (now - resumedAt while running)
-   * It is based on timestamps, so it stays correct even if the browser throttles timers.
+   * Paused time is never counted. It is timestamp-based, so it stays correct even if the browser
+   * throttles or freezes timers while the screen is locked or Chrome is in the background.
+   * States: 'idle' (never started), 'running', 'paused'.
    */
   function newSession(meta, now) {
     return {
+      id: uid(),
       workoutId: meta.workoutId || null,
       title: meta.title || 'Free workout',
       category: meta.category || '',
-      startedAt: now, accumMs: 0, resumedAt: now, heartbeat: now
+      startedAt: now,          // when the session screen was opened
+      timerStartedAt: null,    // when the timer was first started (null = never)
+      accumMs: 0, resumedAt: null, heartbeat: now
     };
+  }
+  function timerState(s) {
+    if (s.resumedAt != null) return 'running';
+    if (s.timerStartedAt != null || s.accumMs > 0) return 'paused';
+    return 'idle';
   }
   function sessionElapsedMs(s, now) {
     return s.accumMs + (s.resumedAt != null ? Math.max(0, now - s.resumedAt) : 0);
@@ -129,28 +139,37 @@
     if (s.resumedAt == null) return s;
     return Object.assign({}, s, { accumMs: sessionElapsedMs(s, now), resumedAt: null, heartbeat: now });
   }
-  function resumeSession(s, now) {
+  /* start (from idle) and resume (from paused) are the same operation */
+  function startTimer(s, now) {
     if (s.resumedAt != null) return s;
-    return Object.assign({}, s, { resumedAt: now, heartbeat: now });
+    return Object.assign({}, s, {
+      timerStartedAt: s.timerStartedAt != null ? s.timerStartedAt : now, resumedAt: now, heartbeat: now
+    });
+  }
+  var resumeSession = startTimer;
+  function resetTimer(s, now) {
+    return Object.assign({}, s, { accumMs: 0, resumedAt: null, timerStartedAt: null, heartbeat: now });
   }
   function validSession(s) {
     return !!s && typeof s === 'object' && typeof s.startedAt === 'number' &&
       typeof s.accumMs === 'number' && isFinite(s.accumMs) && s.accumMs >= 0 &&
       (s.resumedAt === null || typeof s.resumedAt === 'number');
   }
-  /* After a reload: if the page was gone for longer than maxGapMs while "running", we cannot know
-   * whether the person kept working out, so we stop the clock at the last heartbeat (conservative). */
-  function restoreSession(s, now, maxGapMs) {
+  /* After a reload / the browser killing the tab: a timer that was running is NEVER allowed to keep
+   * counting the time the page was away. It is stopped at the last moment the app was alive
+   * (the last heartbeat or the pagehide save) and the person must tap Resume on purpose. */
+  function restoreSession(s, now) {
     if (!validSession(s)) return null;
+    const out = Object.assign({}, s, { id: s.id || uid() });
     if (s.resumedAt != null) {
-      const hb = typeof s.heartbeat === 'number' ? Math.max(s.resumedAt, s.heartbeat) : s.resumedAt;
-      if (now - hb > maxGapMs) {
-        return Object.assign({}, s, {
-          accumMs: s.accumMs + (hb - s.resumedAt), resumedAt: null, heartbeat: now, restoredPaused: true
-        });
-      }
+      const hb = Math.min(now, Math.max(s.resumedAt, typeof s.heartbeat === 'number' ? s.heartbeat : s.resumedAt));
+      out.accumMs = s.accumMs + (hb - s.resumedAt);
+      out.resumedAt = null;
+      out.timerStartedAt = s.timerStartedAt != null ? s.timerStartedAt : s.resumedAt;
+      out.heartbeat = now;
+      out.restoredPaused = true;
     }
-    return s;
+    return out;
   }
 
   /* ---------------- stats & streaks ---------------- */
@@ -235,11 +254,13 @@
 
   function sanitizeWorkout(w) {
     if (!w || typeof w !== 'object') return null;
-    const id = str(w.id, 64), title = str(w.title, 120), url = str(w.url, 500);
-    if (!id || !title || !parseYouTube(url)) return null;
+    const id = str(w.id, 64), title = str(w.title, 120), url = str(w.url, 500), videoId = str(w.videoId, 64) || null;
+    if (!id || !title) return null;
+    if (videoId) { /* uses a saved video on this phone; no YouTube link needed */ if (url && !parseYouTube(url)) return null; }
+    else if (!parseYouTube(url)) return null;
     const dur = num(w.durationMin);
     return {
-      id: id, title: title, url: url,
+      id: id, title: title, url: url, videoId: videoId,
       category: str(w.category, 40) || 'Other',
       durationMin: dur != null ? Math.min(600, Math.max(0, Math.round(dur))) : 0,
       createdAt: num(w.createdAt) || Date.now(),
@@ -277,11 +298,54 @@
       order: num(t.order) || 0, addedAt: num(t.addedAt) || 0
     };
   }
+  /* ---------------- local video files ---------------- */
+  const VIDEO_EXT = { mp4: 'video/mp4', m4v: 'video/mp4', webm: 'video/webm', mov: 'video/quicktime',
+    '3gp': 'video/3gpp', mkv: 'video/x-matroska', ogv: 'video/ogg' };
+  const UNSUPPORTED_EXT = ['avi', 'wmv', 'flv', 'mpg', 'mpeg', 'ts', 'rm', 'rmvb', 'vob', 'divx', 'asf', 'f4v'];
+  const UNSUPPORTED_MIME = ['video/x-msvideo', 'video/x-ms-wmv', 'video/x-flv', 'video/mpeg', 'video/mp2t'];
+  function fileExt(name) { const m = /\.([A-Za-z0-9]{1,6})$/.exec(String(name || '')); return m ? m[1].toLowerCase() : ''; }
+  function stripExt(name) { return String(name || '').replace(/\.[A-Za-z0-9]{1,6}$/, ''); }
+  /* Decides whether a picked file is worth trying. Real playability is checked separately by loading it. */
+  function videoFileCheck(name, type) {
+    const ext = fileExt(name), t = String(type || '').toLowerCase();
+    if (UNSUPPORTED_EXT.indexOf(ext) !== -1 || UNSUPPORTED_MIME.indexOf(t) !== -1) {
+      return { ok: false, error: 'Chrome cannot play ' + (ext ? '.' + ext : 'this') + ' files. Convert the video to MP4 (H.264) or WebM, then import it again.' };
+    }
+    if (VIDEO_EXT[ext] || t.indexOf('video/') === 0) {
+      return { ok: true, ext: ext, mime: t.indexOf('video/') === 0 ? t : VIDEO_EXT[ext] };
+    }
+    return { ok: false, error: 'That does not look like a video file. Choose an MP4 or WebM video.' };
+  }
+  function chunkPlan(size, chunk) {
+    const out = [];
+    for (let i = 0, p = 0; p < size; i++, p += chunk) out.push({ i: i, start: p, end: Math.min(size, p + chunk) });
+    return out;
+  }
+  function fmtBytes(b) {
+    b = Math.max(0, b || 0);
+    if (b >= 1073741824) return (b / 1073741824).toFixed(2) + ' GB';
+    if (b >= 1048576) return (b / 1048576).toFixed(1) + ' MB';
+    return Math.max(1, Math.round(b / 1024)) + ' KB';
+  }
+  function sanitizeVideo(v) {
+    if (!v || typeof v !== 'object') return null;
+    const id = str(v.id, 64), title = str(v.title, 120);
+    if (!id || !title) return null;
+    const dur = num(v.durationSec);
+    return {
+      id: id, title: title, fileName: str(v.fileName, 200), size: Math.max(0, num(v.size) || 0),
+      mime: str(v.mime, 60) || 'video/mp4', durationSec: dur != null && dur > 0 ? dur : null,
+      category: str(v.category, 40), importedAt: num(v.importedAt) || 0,
+      /* video bytes are never part of a JSON backup, so an imported record has no stored file yet */
+      hasBlob: false, chunkCount: 0, poster: ''
+    };
+  }
+
   function sanitizeImport(obj) {
     if (!obj || typeof obj !== 'object' || Array.isArray(obj) || obj.app !== 'vishesh-workout-studio') {
       return { ok: false, error: 'This file is not a Vishesh Workout Studio backup.' };
     }
-    if (typeof obj.version === 'number' && obj.version > 1) {
+    if (typeof obj.version === 'number' && obj.version > 2) {
       return { ok: false, error: 'This backup was made by a newer version of the app.' };
     }
     let skipped = 0;
@@ -303,6 +367,7 @@
       rest: list(obj.rest, sanitizeRest, function (r) { return r.date; }),
       weights: list(obj.weights, sanitizeWeight, function (r) { return r.date; }),
       tracks: list(obj.tracks, sanitizeTrack, function (r) { return r.id; }),
+      videos: list(obj.videos, sanitizeVideo, function (r) { return r.id; }),
       goalMin: null
     };
     const g = obj.prefs && num(obj.prefs.dailyGoalMin);
@@ -316,8 +381,9 @@
     toDateStr: toDateStr, fromDateStr: fromDateStr, isDateStr: isDateStr, addDays: addDays,
     startOfWeek: startOfWeek, weekDates: weekDates, monthMatrix: monthMatrix,
     parseYouTube: parseYouTube, embedUrl: embedUrl, watchUrl: watchUrl, thumbUrl: thumbUrl,
-    newSession: newSession, sessionElapsedMs: sessionElapsedMs, pauseSession: pauseSession,
-    resumeSession: resumeSession, restoreSession: restoreSession,
+    newSession: newSession, timerState: timerState, sessionElapsedMs: sessionElapsedMs, pauseSession: pauseSession,
+    startTimer: startTimer, resumeSession: resumeSession, resetTimer: resetTimer, restoreSession: restoreSession,
+    fileExt: fileExt, stripExt: stripExt, videoFileCheck: videoFileCheck, chunkPlan: chunkPlan, fmtBytes: fmtBytes,
     totalsByDate: totalsByDate, weekTotals: weekTotals, recentWeeks: recentWeeks,
     computeStreaks: computeStreaks,
     shuffled: shuffled, buildQueue: buildQueue, reshuffle: reshuffle, stepQueue: stepQueue,
