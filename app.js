@@ -34,7 +34,9 @@
     upload: '<path d="M12 15V3M7 8l5-5 5 5M4 21h16"/>',
     external: '<path d="M14 3h7v7M21 3l-9 9M19 14v6H4V5h6"/>',
     left: '<path d="M15 18l-6-6 6-6"/>',
-    right: '<path d="M9 18l6-6-6-6"/>'
+    right: '<path d="M9 18l6-6-6-6"/>',
+    fullscreen: '<path d="M8 3H5a2 2 0 00-2 2v3M16 3h3a2 2 0 012 2v3M21 16v3a2 2 0 01-2 2h-3M3 16v3a2 2 0 002 2h3"/>',
+    minimize: '<path d="M8 3v5H3M16 3v5h5M3 16h5v5M21 16h-5v5"/>'
   };
   const icon = (n, size) => '<svg class="ic" viewBox="0 0 24 24" width="' + (size || 22) + '" height="' + (size || 22) +
     '" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + ICONS[n] + '</svg>';
@@ -339,9 +341,16 @@
    * With the YouTube IFrame API available, playback errors (e.g. embedding disabled) are detected and the
    * fallback is highlighted. If the API cannot load, a plain iframe is used and the "Open in YouTube"
    * button stays visible. */
-  function mountVideo(box, fbBox, p) {
-    let player = null, dead = false, failed = false, ready = false, timer = null;
-    if (!p) { fbBox.innerHTML = '<div class="fallback alert">This workout has no valid YouTube link. Edit it to fix the link.</div>'; return function () {}; }
+  function mountVideo(box, fbBox, p, onPlaybackChange) {
+    let player = null, dead = false, failed = false, ready = false, timer = null, desiredPlayback = null;
+    const controller = function destroy() {
+      dead = true; clearTimeout(timer);
+      try { if (player && player.destroy) player.destroy(); } catch (e) { /* ignore */ }
+      box.innerHTML = '';
+    };
+    controller.play = () => { desiredPlayback = true; try { if (player && player.playVideo) player.playVideo(); } catch (e) { /* ignore */ } };
+    controller.pause = () => { desiredPlayback = false; try { if (player && player.pauseVideo) player.pauseVideo(); } catch (e) { /* ignore */ } };
+    if (!p) { fbBox.innerHTML = '<div class="fallback alert">This workout has no valid YouTube link. Edit it to fix the link.</div>'; return controller; }
     const wUrl = C.watchUrl(p);
     fbBox.innerHTML = '<div class="fallback" id="fb-row"><span class="fb-msg">Video not playing? Open it in YouTube.</span><a class="btn btn-ghost btn-sm" href="' + esc(wUrl) + '" target="_blank" rel="noopener noreferrer">' + icon('external', 16) + ' Open in YouTube</a></div>';
     const fail = () => {
@@ -356,11 +365,10 @@
     function plain() {
       box.innerHTML = '';
       const fr = document.createElement('iframe');
-      fr.src = C.embedUrl(p);
       fr.title = 'Workout video';
       fr.setAttribute('allow', 'accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share');
-      fr.setAttribute('allowfullscreen', '');
       fr.setAttribute('referrerpolicy', 'strict-origin-when-cross-origin');
+      fr.src = C.embedUrl(p) + '&enablejsapi=1&origin=' + encodeURIComponent(location.origin) + '&fs=0';
       box.appendChild(fr);
     }
     box.innerHTML = '<div class="player-loading">Loading video…</div>';
@@ -370,17 +378,22 @@
       const mount = document.createElement('div');
       mount.id = 'yt-' + Math.random().toString(36).slice(2);
       box.appendChild(mount);
-      const vars = { playsinline: 1, rel: 0, modestbranding: 1 };
-      const opts = { host: 'https://www.youtube-nocookie.com', playerVars: vars, events: { onReady: () => { ready = true; }, onError: fail } };
+      const vars = { playsinline: 1, rel: 0, modestbranding: 1, fs: 0, enablejsapi: 1, origin: location.origin };
+      const opts = { host: 'https://www.youtube-nocookie.com', playerVars: vars, events: {
+        onReady: () => { ready = true; if (desiredPlayback === true) player.playVideo(); else if (desiredPlayback === false) player.pauseVideo(); },
+        onStateChange: ev => {
+          if (dead || !onPlaybackChange || !window.YT || !window.YT.PlayerState) return;
+          if (ev.data === window.YT.PlayerState.PLAYING) onPlaybackChange(true);
+          else if (ev.data === window.YT.PlayerState.PAUSED) onPlaybackChange(false);
+          // ENDED is intentionally ignored: the workout timer must continue.
+        },
+        onError: fail
+      } };
       if (p.id) { opts.videoId = p.id; if (p.list) vars.list = p.list; } else { vars.listType = 'playlist'; vars.list = p.list; }
       try { player = new window.YT.Player(mount.id, opts); } catch (e) { plain(); return; }
       timer = setTimeout(() => { if (!ready) fail(); }, 12000);
     }).catch(() => { if (!dead) plain(); });
-    return function destroy() {
-      dead = true; clearTimeout(timer);
-      try { if (player && player.destroy) player.destroy(); } catch (e) { /* ignore */ }
-      box.innerHTML = '';
-    };
+    return controller;
   }
   function previewWorkout(id) {
     const w = S.workouts.find(x => x.id === id);
@@ -398,7 +411,7 @@
   /* ================= WORKOUT SESSION ================= */
   /* The timer is MANUAL. Opening a workout shows 00:00 and nothing counts until START TIMER is tapped.
    * Loading/playing a video, reloading the page, or switching tabs never starts, resumes or changes it. */
-  let session = null, tickTimer = null, hbTimer = null, videoDestroy = null, wakeLock = null, finishing = false;
+  let session = null, tickTimer = null, hbTimer = null, videoDestroy = null, sessionVideo = null, wakeLock = null, finishing = false;
   const persistSession = () => { if (session) Prefs.set('active', session); else Prefs.remove('active'); };
   async function lockScreen() {
     try { if ('wakeLock' in navigator && !wakeLock) { wakeLock = await navigator.wakeLock.request('screen'); wakeLock.addEventListener('release', () => { wakeLock = null; }); } } catch (e) { wakeLock = null; }
@@ -432,18 +445,26 @@
     const el = $('#session');
     el.innerHTML = '<div class="session-inner"><div class="s-head"><div><p class="eyebrow">' + esc(session.category || 'Workout session') + '</p><h2>' + esc(session.title) + '</h2></div>' +
       '<button class="icon-btn" data-action="discardSession" aria-label="Discard session">' + icon('x', 22) + '</button></div>' +
-      (kind !== 'none' ? '<div class="player" id="s-player"></div><div id="s-fb"></div>' : '') +
+      (kind !== 'none' ? '<div class="player-stage" id="s-stage"><div class="player" id="s-player"></div>' +
+        '<button class="player-fullscreen-btn" data-action="toggleVideoFullscreen" aria-label="Enter video fullscreen">' + icon('fullscreen', 20) + '</button>' +
+        '<div class="floating-timer" id="s-floating-timer" aria-label="Floating workout timer">' +
+        '<div class="floating-timer-drag" data-drag-handle><div class="floating-time" id="floating-time">00:00</div><div class="floating-state" id="floating-state">Timer not started</div></div>' +
+        '<button class="floating-play" id="floating-play" data-action="timerMain" aria-label="Start timer">' + icon('play', 20) + '</button>' +
+        '<div class="floating-resize" data-resize-handle aria-label="Resize timer"></div></div></div><div id="s-fb"></div>' : '') +
       '<div class="timer" id="timer">00:00</div><div class="timer-state" id="timer-state">Timer not started</div>' +
       '<div class="s-controls"><button class="btn btn-primary btn-main" id="btn-main" data-action="timerMain"></button>' +
       '<button class="btn btn-ghost" id="btn-reset" data-action="resetTimer">RESET TO 0</button>' +
       '<button class="btn btn-finish" id="btn-finish" data-action="finishSession">' + icon('check', 20) + ' FINISH WORKOUT</button></div>' +
       '<div class="mini"><button class="ctrl" data-action="prevTrack" aria-label="Previous song">' + icon('prev', 20) + '</button><button class="ctrl js-play" data-action="togglePlay"></button><button class="ctrl" data-action="nextTrack" aria-label="Next song">' + icon('next', 20) + '</button><span class="js-np-title"></span></div>' +
+      '<button class="music-sync-toggle ' + (Prefs.get('syncMusic', false) ? 'on' : '') + '" id="music-sync-toggle" data-action="toggleSyncMusic">' + (Prefs.get('syncMusic', false) ? 'MUSIC SYNC ON' : 'MUSIC SYNC OFF') + '</button>' +
       '<p class="muted small" style="margin-top:14px">The timer only counts while it is running. Tap START TIMER when you begin. Paused time is not added to your workout.</p></div>';
     el.hidden = false;
     document.body.classList.add('lock');
     if (videoDestroy) videoDestroy();
-    videoDestroy = kind === 'youtube' ? mountVideo($('#s-player'), $('#s-fb'), C.parseYouTube(w.url))
-      : kind === 'local' ? mountLocalVideo($('#s-player'), $('#s-fb'), w.videoId) : null;
+    videoDestroy = kind === 'youtube' ? mountVideo($('#s-player'), $('#s-fb'), C.parseYouTube(w.url), syncTimerFromVideo)
+      : kind === 'local' ? mountLocalVideo($('#s-player'), $('#s-fb'), w.videoId, syncTimerFromVideo) : null;
+    sessionVideo = videoDestroy;
+    bindFloatingTimer();
     updateTimer();
     clearInterval(tickTimer); clearInterval(hbTimer);
     tickTimer = setInterval(updateTimer, 250);
@@ -469,13 +490,36 @@
       b.setAttribute('aria-label', st === 'idle' ? 'Start timer' : st === 'running' ? 'Pause timer' : 'Resume timer');
     }
     const r = $('#btn-reset'); if (r) r.disabled = st === 'idle';
+    const ft = $('#floating-time'); if (ft) ft.textContent = C.fmtClock(C.sessionElapsedMs(session, Date.now()) / 1000);
+    const fs = $('#floating-state'); if (fs) fs.textContent = st === 'idle' ? 'NOT STARTED' : st === 'running' ? 'WORKOUT RUNNING' : 'PAUSED';
+    const fp = $('#floating-play');
+    if (fp) { const mode = st === 'running' ? 'pause' : 'play'; fp.innerHTML = icon(mode, 20); fp.setAttribute('aria-label', mode === 'play' ? 'Start or resume timer' : 'Pause timer'); }
+    const sm = $('#music-sync-toggle');
+    if (sm) { const on = Prefs.get('syncMusic', false); sm.textContent = on ? 'MUSIC SYNC ON' : 'MUSIC SYNC OFF'; sm.classList.toggle('on', on); }
+  }
+  function syncTimerFromVideo(playing) {
+    if (!session) return;
+    const running = tState() === 'running';
+    if (playing && !running) {
+      session = C.startTimer(session, Date.now()); persistSession(); lockScreen(); updateTimer(); syncMusicToTimer(true);
+    } else if (!playing && running) {
+      session = C.pauseSession(session, Date.now()); persistSession(); unlockScreen(); updateTimer(); syncMusicToTimer(false);
+    }
+  }
+  function syncMusicToTimer(playing) {
+    if (!Prefs.get('syncMusic', false) || !Player.currentId) return;
+    if (playing) Player.audio.play().catch(() => toast('Tap play to resume music'));
+    else Player.audio.pause();
   }
   function timerMain() {
     if (!session) return;
     const now = Date.now();
-    if (C.timerState(session) === 'running') { session = C.pauseSession(session, now); unlockScreen(); }
+    const wasRunning = C.timerState(session) === 'running';
+    if (wasRunning) { session = C.pauseSession(session, now); unlockScreen(); }
     else { session = C.startTimer(session, now); lockScreen(); }   // START (from 00:00) or RESUME (after a pause)
     persistSession(); updateTimer();
+    if (sessionVideo) { if (wasRunning) sessionVideo.pause(); else sessionVideo.play(); }
+    syncMusicToTimer(!wasRunning);
   }
   async function resetTimerAction() {
     if (!session || tState() === 'idle') return;
@@ -485,15 +529,77 @@
       if (c !== 'yes' || !session) return;
     }
     session = C.resetTimer(session, Date.now());
-    unlockScreen(); persistSession(); updateTimer();
+    unlockScreen(); persistSession(); updateTimer(); syncMusicToTimer(false);
   }
   function closeOverlay() {
     clearInterval(tickTimer); clearInterval(hbTimer);
     if (videoDestroy) { videoDestroy(); videoDestroy = null; }
+    sessionVideo = null;
     const el = $('#session'); el.hidden = true; el.innerHTML = '';
     document.body.classList.remove('lock');
     unlockScreen();
   }
+  function toggleVideoFullscreen() {
+    const stage = $('#s-stage');
+    if (!stage) return;
+    if (document.fullscreenElement === stage) {
+      if (document.exitFullscreen) document.exitFullscreen().catch(() => {});
+      return;
+    }
+    if (!stage.requestFullscreen) { toast('Fullscreen overlay is not supported by this browser'); return; }
+    stage.requestFullscreen({ navigationUI: 'hide' }).then(() => applyFloatingTimerLayout()).catch(() => toast('Could not open fullscreen. Try the fullscreen button again.'));
+  }
+  function applyFloatingTimerLayout() {
+    const stage = $('#s-stage'), timer = $('#s-floating-timer');
+    if (!stage || !timer || document.fullscreenElement !== stage) return;
+    const rect = stage.getBoundingClientRect();
+    const saved = Prefs.get('floatTimer', { x: 14, y: 14, w: 184 });
+    const width = Math.max(132, Math.min(Number(saved.w) || 184, 270, rect.width - 16));
+    const left = Math.max(8, Math.min(Number(saved.x) || 14, rect.width - width - 8));
+    const top = Math.max(8, Math.min(Number(saved.y) || 14, rect.height - 86));
+    timer.style.width = width + 'px'; timer.style.left = left + 'px'; timer.style.top = top + 'px';
+  }
+  function saveFloatingTimerLayout() {
+    const timer = $('#s-floating-timer');
+    if (!timer) return;
+    Prefs.set('floatTimer', { x: parseFloat(timer.style.left) || 8, y: parseFloat(timer.style.top) || 8, w: parseFloat(timer.style.width) || 184 });
+  }
+  function bindFloatingTimer() {
+    const stage = $('#s-stage'), timer = $('#s-floating-timer');
+    if (!stage || !timer || timer.dataset.bound === '1') return;
+    timer.dataset.bound = '1';
+    timer.addEventListener('pointerdown', e => {
+      const resize = e.target.closest('[data-resize-handle]');
+      const drag = e.target.closest('[data-drag-handle]');
+      if (!resize && !drag) return;
+      if (document.fullscreenElement !== stage) return;
+      e.preventDefault();
+      const sr = stage.getBoundingClientRect(), tr = timer.getBoundingClientRect();
+      const startX = e.clientX, startY = e.clientY, startLeft = tr.left - sr.left, startTop = tr.top - sr.top, startWidth = tr.width;
+      const move = ev => {
+        if (resize) {
+          const max = Math.max(132, sr.width - startLeft - 8);
+          timer.style.width = Math.max(132, Math.min(270, max, startWidth + ev.clientX - startX)) + 'px';
+        } else {
+          const w = timer.getBoundingClientRect().width, h = timer.getBoundingClientRect().height;
+          timer.style.left = Math.max(8, Math.min(sr.width - w - 8, startLeft + ev.clientX - startX)) + 'px';
+          timer.style.top = Math.max(8, Math.min(sr.height - h - 8, startTop + ev.clientY - startY)) + 'px';
+        }
+      };
+      const end = () => { document.removeEventListener('pointermove', move); document.removeEventListener('pointerup', end); document.removeEventListener('pointercancel', end); saveFloatingTimerLayout(); };
+      document.addEventListener('pointermove', move, { passive: false });
+      document.addEventListener('pointerup', end, { once: true });
+      document.addEventListener('pointercancel', end, { once: true });
+    });
+  }
+  document.addEventListener('fullscreenchange', () => {
+    const stage = $('#s-stage'), button = $('.player-fullscreen-btn');
+    const active = !!(stage && document.fullscreenElement === stage);
+    if (button) { button.innerHTML = icon(active ? 'minimize' : 'fullscreen', 20); button.setAttribute('aria-label', active ? 'Exit video fullscreen' : 'Enter video fullscreen'); }
+    if (active) { applyFloatingTimerLayout(); updateTimer(); }
+  });
+  window.addEventListener('resize', () => applyFloatingTimerLayout());
+
   async function finishSession() {
     if (!session || finishing) return;          // ignore repeated taps
     finishing = true;
@@ -501,6 +607,7 @@
       const sid = session.id, wasRunning = tState() === 'running';
       session = C.pauseSession(session, Date.now()); // stop the timer first
       unlockScreen(); persistSession(); updateTimer();
+      if (sessionVideo) sessionVideo.pause(); syncMusicToTimer(false);
       const sec = Math.round(session.accumMs / 1000);
       const neverStarted = tState() === 'idle' || sec < 1;
       const choice = neverStarted
@@ -509,7 +616,7 @@
       if (!session || session.id !== sid) return;
       if (choice === 'save' && !neverStarted) await saveSession(sec);
       else if (choice === 'discard') endSession();
-      else if (wasRunning) { session = C.startTimer(session, Date.now()); persistSession(); lockScreen(); updateTimer(); } // back out: carry on counting
+      else if (wasRunning) { session = C.startTimer(session, Date.now()); persistSession(); lockScreen(); updateTimer(); if (sessionVideo) sessionVideo.play(); syncMusicToTimer(true); } // back out: carry on counting
     } finally { finishing = false; }
   }
   async function saveSession(sec) {
@@ -531,10 +638,11 @@
     if (!session || finishing) return;
     const sid = session.id, wasRunning = tState() === 'running';
     session = C.pauseSession(session, Date.now()); persistSession(); updateTimer();
+    if (sessionVideo) sessionVideo.pause(); syncMusicToTimer(false);
     const c = await confirmSheet({ title: 'Discard session?', text: 'This session will not be saved to your history.', buttons: [{ label: 'Keep session', value: 'keep', cls: 'btn-primary' }, { label: 'Discard', value: 'discard', cls: 'btn-danger' }] });
     if (!session || session.id !== sid) return;
     if (c === 'discard') endSession();
-    else if (wasRunning) { session = C.startTimer(session, Date.now()); persistSession(); lockScreen(); updateTimer(); }
+    else if (wasRunning) { session = C.startTimer(session, Date.now()); persistSession(); lockScreen(); updateTimer(); if (sessionVideo) sessionVideo.play(); syncMusicToTimer(true); }
   }
 
   /* ================= MUSIC ================= */
@@ -943,20 +1051,31 @@
 
   /* ---- playback ---- */
   /* Rebuilds an object URL from the stored Blob every time; the URL is never saved, and is released on close. */
-  function mountLocalVideo(box, fbBox, videoId) {
+  function mountLocalVideo(box, fbBox, videoId, onPlaybackChange) {
     let dead = false, url = null, el = null;
+    const controller = function destroy() {
+      dead = true;
+      if (el) { try { el.pause(); el.removeAttribute('src'); el.load(); } catch (e) { /* ignore */ } }
+      if (url) { URL.revokeObjectURL(url); url = null; }
+      box.innerHTML = ''; box.classList.remove('local');
+    };
+    controller.play = () => { if (el) { const p = el.play(); if (p && p.catch) p.catch(() => toast('Tap the video play button to start playback')); } };
+    controller.pause = () => { if (el) el.pause(); };
     const note = (html, alert) => { fbBox.innerHTML = '<div class="fallback' + (alert ? ' alert' : '') + '"><span>' + html + '</span></div>'; };
     const meta = S.videos.find(v => v.id === videoId);
     box.classList.add('local');
-    if (!meta) { box.innerHTML = '<div class="player-loading">Video not available</div>'; note('This workout\'s saved video is no longer on this phone (it may have been deleted). Edit the workout to pick another video or add a YouTube link. You can still use the timer.', true); return function () {}; }
-    if (!meta.hasBlob) { box.innerHTML = '<div class="player-loading">Video file missing</div>'; note('The file for “' + esc(meta.title) + '” is not stored on this phone. Go to Workouts → My Videos → Import Video and pick the same file to reconnect it.', true); return function () {}; }
+    if (!meta) { box.innerHTML = '<div class="player-loading">Video not available</div>'; note('This workout\'s saved video is no longer on this phone (it may have been deleted). Edit the workout to pick another video or add a YouTube link. You can still use the timer.', true); return controller; }
+    if (!meta.hasBlob) { box.innerHTML = '<div class="player-loading">Video file missing</div>'; note('The file for “' + esc(meta.title) + '” is not stored on this phone. Go to Workouts → My Videos → Import Video and pick the same file to reconnect it.', true); return controller; }
     box.innerHTML = '<div class="player-loading">Loading saved video…</div>';
     Vid.blobFor(meta).then(blob => {
       if (dead) return;
       url = URL.createObjectURL(blob);
       el = document.createElement('video');
       el.controls = true; el.playsInline = true; el.preload = 'metadata';
-      el.setAttribute('playsinline', ''); el.setAttribute('controlslist', 'nodownload');
+      el.setAttribute('playsinline', ''); el.setAttribute('controlslist', 'nodownload nofullscreen noremoteplayback');
+      el.addEventListener('play', () => { if (!dead && onPlaybackChange) onPlaybackChange(true); });
+      el.addEventListener('pause', () => { if (!dead && !el.ended && onPlaybackChange) onPlaybackChange(false); });
+      // Deliberately do not pause the workout timer when the video reaches its end.
       if (meta.poster) el.poster = meta.poster;
       el.addEventListener('error', () => {
         const code = el.error ? el.error.code : 0;
@@ -970,12 +1089,7 @@
       box.innerHTML = '<div class="player-loading">Can\'t load video</div>';
       note(e && e.name === 'VideoDamaged' ? 'The saved data for this video is incomplete or damaged. Delete it and import the original again.' : 'The saved video could not be opened' + (e && e.message ? ' (' + esc(e.message) + ')' : '') + '. Your other data is unaffected.', true);
     });
-    return function destroy() {
-      dead = true;
-      if (el) { try { el.pause(); el.removeAttribute('src'); el.load(); } catch (e) { /* ignore */ } }
-      if (url) { URL.revokeObjectURL(url); url = null; }
-      box.innerHTML = ''; box.classList.remove('local');
-    };
+    return controller;
   }
   function playVideo(id) {
     const v = S.videos.find(x => x.id === id);
@@ -1281,6 +1395,8 @@
     startFree: () => startSession(null),
     resumeSession: openOverlay,
     timerMain: timerMain,
+    toggleVideoFullscreen: toggleVideoFullscreen,
+    toggleSyncMusic: () => { const on = !Prefs.get('syncMusic', false); Prefs.set('syncMusic', on); if (on) syncMusicToTimer(tState() === 'running'); updateTimer(); toast(on ? 'Music will follow the workout timer' : 'Music sync turned off'); },
     resetTimer: resetTimerAction,
     finishSession: finishSession,
     discardSession: discardSession,

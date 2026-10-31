@@ -6,7 +6,7 @@
  * changed sw.js, downloads all files fresh into a NEW cache, and the app offers an "Update now" button.
  * The old version keeps working until you tap it, so an update can never break a running workout.
  */
-const VERSION = '2026-10-30-v3';
+const VERSION = '2026-10-31-v1';
 const CACHE = 'vws-' + VERSION;
 const SHELL = ['./', './index.html', './styles.css', './core.js', './app.js', './manifest.webmanifest', './icon-192.png', './icon-512.png'];
 
