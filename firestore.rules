@@ -1,0 +1,51 @@
+rules_version = '2';
+
+// Vishesh Workout Studio — Cloud Firestore security rules.
+// Every signed-in person can read and write ONLY the documents under users/{their own uid}.
+// Nothing else in the database is readable or writable. There is no public access.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function isOwner(uid) { return signedIn() && request.auth.uid == uid; }
+
+    // Profile: users/{uid}
+    match /users/{uid} {
+      allow read: if isOwner(uid);
+      allow create, update: if isOwner(uid)
+        && request.resource.data.keys().hasOnly(['displayName', 'email', 'updatedAt', 'schema', 'goalMin'])
+        && request.resource.data.displayName is string && request.resource.data.displayName.size() <= 120
+        && request.resource.data.email is string && request.resource.data.email.size() <= 320
+        && (!('goalMin' in request.resource.data) || request.resource.data.goalMin is number);
+      allow delete: if false;
+    }
+
+    // Synced records: users/{uid}/records/{store}__{key}
+    // Records are never really deleted; a delete is stored as deleted:true so other phones learn about it.
+    match /users/{uid}/records/{rid} {
+      allow read: if isOwner(uid);
+      allow create, update: if isOwner(uid)
+        && request.resource.data.keys().hasOnly(['store', 'key', 'deleted', 'data', 'updatedAt', 'syncedAt', 'device', 'schema'])
+        && request.resource.data.store in ['workouts', 'sessions', 'rest', 'weights']
+        && request.resource.data.key is string && request.resource.data.key.size() <= 600
+        // The document id MUST be exactly  <store>__<key>.  `key` holds the URL-encoded record key (the app encodes it),
+        // so it may only contain URL-encoding characters. This ties every document to the record it claims to be.
+        && request.resource.data.key.matches("^[A-Za-z0-9_.!~*'()%-]+$")
+        && rid == request.resource.data.store + '__' + request.resource.data.key
+        && request.resource.data.deleted is bool
+        // `data` is the record itself: either null (a deletion marker) or a small map (at most 40 fields;
+        // real records have about 10). Firestore's own 1 MiB per-document limit still applies on top.
+        && (request.resource.data.data == null || (request.resource.data.data is map && request.resource.data.data.size() <= 40))
+        && request.resource.data.updatedAt is number
+        && request.resource.data.syncedAt == request.time
+        // a write must be strictly newer than the stored copy: a stale device can never overwrite a newer record
+        && (resource == null || request.resource.data.updatedAt > resource.data.updatedAt);
+      allow delete: if false;
+    }
+
+    // Everything else: closed.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

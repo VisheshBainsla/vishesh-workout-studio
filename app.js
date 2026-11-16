@@ -50,21 +50,29 @@
   };
 
   /* ---------------- IndexedDB with in-memory fallback ---------------- */
-  const STORES = { workouts: 'id', sessions: 'id', rest: 'date', weights: 'date', tracks: 'id', videos: 'id', videoChunks: ['vid', 'idx'] };
+  const STORES = { workouts: 'id', sessions: 'id', rest: 'date', weights: 'date', tracks: 'id', videos: 'id', videoChunks: ['vid', 'idx'], sync: 'k', syncKv: 'k' };
+  const SYNCED = ['workouts', 'sessions', 'rest', 'weights'];   // the only stores that go to the cloud
   const DB = {
-    db: null, memory: false, mem: {}, error: null,
+    db: null, memory: false, mem: {}, error: null, versionError: false, upgradedFrom: 0,
     open() {
       return new Promise(resolve => {
         const fallback = e => { DB.memory = true; DB.error = e; Object.keys(STORES).forEach(s => { DB.mem[s] = new Map(); }); resolve(); };
         if (!window.indexedDB) return fallback(new Error('IndexedDB unavailable'));
         let req;
-        try { req = window.indexedDB.open('vishesh-workout-studio', 2); } catch (e) { return fallback(e); }
-        req.onupgradeneeded = () => {
+        try { req = window.indexedDB.open('vishesh-workout-studio', 3); } catch (e) { return fallback(e); }
+        req.onupgradeneeded = ev => {
+          DB.upgradedFrom = ev && ev.oldVersion ? ev.oldVersion : 0;   // 0 = brand new database
           const db = req.result;
           Object.keys(STORES).forEach(s => { if (!db.objectStoreNames.contains(s)) db.createObjectStore(s, { keyPath: STORES[s] }); });
         };
         req.onsuccess = () => { DB.db = req.result; DB.db.onversionchange = () => { DB.db.close(); toast('The app was updated in another tab. Please reload this page.'); }; resolve(); };
-        req.onerror = () => fallback(req.error);
+        req.onerror = () => {
+          // VersionError = the database on this phone was already upgraded by a NEWER version of the app.
+          // That is not "storage unavailable": the data is there and must not be hidden, replaced or touched.
+          // Do not fall back to memory mode; the boot code stops and asks for the newer app version.
+          if (req.error && req.error.name === 'VersionError') { DB.versionError = true; DB.error = req.error; return resolve(); }
+          fallback(req.error);
+        };
         req.onblocked = () => toast('Close other tabs of this app so it can finish updating its storage.');
       });
     },
@@ -80,19 +88,70 @@
       });
     },
     getAll(store) { return DB.memory ? Promise.resolve(Array.from(DB.mem[store].values())) : DB.run(store, 'readonly', os => os.getAll()); },
+    get(store, key) { return DB.memory ? Promise.resolve(DB.mem[store].get(key) || null) : DB.run(store, 'readonly', os => os.get(key)).then(r => r || null); },
+    // One atomic transaction over several stores. ops.put / ops.del / ops.clearMeta / ops.clearCursors
+    batch(stores, fn) {
+      if (DB.memory) {
+        const ops = {
+          put: (s, r) => DB.mem[s].set(r[STORES[s]], r), del: (s, k) => DB.mem[s].delete(k), clear: s => DB.mem[s].clear(),
+          clearMeta: st => { DB.mem.sync.forEach((m, k) => { if (m.store === st) DB.mem.sync.delete(k); }); },
+          clearCursors: () => { DB.mem.syncKv.forEach((m, k) => { if (String(k).indexOf('cursor:') === 0) DB.mem.syncKv.delete(k); }); }
+        };
+        try { fn(ops); } catch (e) { return Promise.reject(e); }
+        return Promise.resolve();
+      }
+      return new Promise((res, rej) => {
+        let t;
+        try { t = DB.db.transaction(stores, 'readwrite'); } catch (e) { return rej(e); }
+        const sweep = (name, test) => { t.objectStore(name).openCursor().onsuccess = ev => { const c = ev.target.result; if (c) { if (test(c.value)) c.delete(); c.continue(); } }; };
+        const ops = {
+          put: (s, r) => { t.objectStore(s).put(r); }, del: (s, k) => { t.objectStore(s).delete(k); }, clear: s => { t.objectStore(s).clear(); },
+          clearMeta: st => sweep('sync', m => m.store === st),
+          clearCursors: () => sweep('syncKv', m => String(m.k).indexOf('cursor:') === 0)
+        };
+        try { fn(ops); } catch (e) { try { t.abort(); } catch (_) { /* ignore */ } return rej(e); }
+        t.oncomplete = () => res();
+        t.onerror = ev => rej((ev && ev.target && ev.target.error) || t.error || new Error('Transaction failed'));
+        t.onabort = () => rej(t.error || new Error('Transaction aborted'));
+      });
+    },
+    // Called after any change to workouts / sessions / rest / weights so cloud sync can start.
+    onLocalChange: null,
+    changed() { if (DB.onLocalChange) { try { DB.onLocalChange(); } catch (e) { console.error(e); } } },
+    // Sync marks for a set of records. Each stamp is strictly newer than the version it replaces (even if this
+    // phone's clock is behind the phone that wrote that version), so a real later edit can never lose on a clock.
+    async metas(store, entries) {
+      const now = Date.now();
+      const prev = await Promise.all(entries.map(e => DB.get('sync', store + '|' + e.key)));
+      return entries.map((e, i) => {
+        const p = prev[i] && prev[i].updatedAt;
+        return { k: store + '|' + e.key, store: store, key: e.key, updatedAt: window.VWSSync ? VWSSync.nextStamp(p, now) : Math.max(now, (p || 0) + 1), deleted: !!e.deleted, dirty: true };
+      });
+    },
     put(store, rec) {
+      if (SYNCED.indexOf(store) !== -1) {   // the record and its "needs upload" mark are saved together or not at all
+        return DB.metas(store, [{ key: rec[STORES[store]] }]).then(ms => DB.batch([store, 'sync'], o => { o.put(store, rec); o.put('sync', ms[0]); })).then(DB.changed);
+      }
       if (DB.memory) { DB.mem[store].set(rec[STORES[store]], rec); return Promise.resolve(); }
       return DB.run(store, 'readwrite', os => { os.put(rec); });
     },
     putMany(store, arr) {
+      if (SYNCED.indexOf(store) !== -1) {
+        return DB.metas(store, arr.map(r => ({ key: r[STORES[store]] }))).then(ms => DB.batch([store, 'sync'], o => { arr.forEach((r, i) => { o.put(store, r); o.put('sync', ms[i]); }); })).then(DB.changed);
+      }
       if (DB.memory) { arr.forEach(r => DB.mem[store].set(r[STORES[store]], r)); return Promise.resolve(); }
       return DB.run(store, 'readwrite', os => { arr.forEach(r => os.put(r)); });
     },
     del(store, key) {
+      if (SYNCED.indexOf(store) !== -1) {   // leaves a "deleted" mark so the deletion reaches the cloud and other phones
+        return DB.metas(store, [{ key: key, deleted: true }]).then(ms => DB.batch([store, 'sync'], o => { o.del(store, key); o.put('sync', ms[0]); })).then(DB.changed);
+      }
       if (DB.memory) { DB.mem[store].delete(key); return Promise.resolve(); }
       return DB.run(store, 'readwrite', os => { os.delete(key); });
     },
+    // Clearing a store only empties THIS phone. It never creates deletions in the cloud.
     clear(store) {
+      if (SYNCED.indexOf(store) !== -1) return DB.batch([store, 'sync', 'syncKv'], o => { o.clear(store); o.clearMeta(store); o.clearCursors(); });
       if (DB.memory) { DB.mem[store].clear(); return Promise.resolve(); }
       return DB.run(store, 'readwrite', os => { os.clear(); });
     }
@@ -113,7 +172,7 @@
 
   async function loadAll() {
     for (const s of Object.keys(STORES)) {
-      if (s === 'videoChunks') continue; // video bytes are only read when a video is played
+      if (s === 'videoChunks' || s === 'sync' || s === 'syncKv') continue; // video bytes are only read when a video is played
       try { S[s] = await DB.getAll(s); } catch (e) { console.error(e); S[s] = []; toast('Some saved data could not be read.'); }
     }
   }
@@ -1273,13 +1332,16 @@
   /* ================= SETTINGS, BACKUP, PRIVACY ================= */
   function openSettings() {
     const last = Prefs.get('lastBackup', null);
+    const cs = chipState();
     openSheet('<h3 class="sheet-title">Settings &amp; backup</h3>' +
+      '<div class="card-title">Account &amp; cloud sync</div><button class="btn btn-ghost btn-block" data-action="openAccount">' + esc(Acct.user ? 'Account · ' + (Acct.user.email || acctName()) + ' · ' + cs[1] : (window.VWSCloud && VWSCloud.configured ? 'Sign in / create account' : 'Cloud sync (not set up)')) + '</button><hr>' +
       '<form data-form="settings" novalidate><div class="field"><label for="s-goal">Daily goal (minutes)</label><input type="number" id="s-goal" name="goal" min="5" max="600" inputmode="numeric" value="' + Prefs.get('goalMin', 30) + '"></div><button class="btn btn-ghost btn-block" type="submit">Save goal</button></form><hr>' +
       '<div class="card-title">Backup</div><div class="stack"><button class="btn btn-primary btn-block" data-action="exportData">' + icon('download', 20) + ' Export backup (JSON)</button><button class="btn btn-ghost btn-block" data-action="importData">' + icon('upload', 20) + ' Import backup</button></div>' +
       '<p class="muted small" style="margin-top:10px">' + (last ? 'Last backup: ' + esc(new Date(last).toLocaleString('en-IN')) : 'You have not made a backup yet.') + ' <b>Song files and imported video files are NOT included in a JSON backup</b>, only their names and details. To back up a video file, use “Save copy” on it in Workouts → My Videos.</p><hr>' +
       '<div class="card-title">Privacy &amp; storage</div>' +
-      '<p class="muted small">Everything stays on this device. Nothing is uploaded and there are no accounts or API keys. Your data lives in this browser\'s storage and can be erased if you clear site data, uninstall the browser, run a storage cleaner, or use private mode. It is not a guaranteed backup, so export regularly.</p>' +
+      '<p class="muted small">By default everything stays on this device. If you sign in, your workout history, rest days, weights and workout list are also saved to your private cloud account (Google Firebase) so other phones can restore them. Song and video files never leave this phone. Your data on this phone lives in this browser\'s storage and can be erased if you clear site data, uninstall the browser, run a storage cleaner, or use private mode. Without an account it is not a guaranteed backup, so export regularly.</p>' +
       '<p class="muted small" id="storage-info">Checking storage…</p><button class="btn btn-ghost btn-block" data-action="requestPersist">Ask browser to protect my data</button><hr>' +
+      '<button class="btn btn-ghost btn-block" data-action="downloadSafetyCopy">Download pre-update safety copy</button><p class="muted small">Workouts, history, rest days and weights only. <b>Songs and imported videos are NOT included</b> (their files stay inside the app on this phone and are not changed).</p><hr>' +
       '<button class="btn btn-danger btn-block" data-action="clearAll">Delete all app data</button><button class="btn btn-ghost btn-block gap-top" data-action="closeSheet">Close</button>');
     storageInfo();
   }
@@ -1321,7 +1383,7 @@
     const d = r.data;
     const c = await confirmSheet({
       title: 'Import backup?',
-      text: 'Found <b>' + d.workouts.length + '</b> workouts, <b>' + d.sessions.length + '</b> sessions, <b>' + d.rest.length + '</b> rest days, <b>' + d.weights.length + '</b> weight entries' + (r.skipped ? ' (' + r.skipped + ' invalid items skipped)' : '') + (d.videos.length ? ' and <b>' + d.videos.length + '</b> video records (details only, not the video files)' : '') + '.<br><br><b>Merge</b> adds them to what you have (same items are overwritten). <b>Replace</b> wipes your current workouts, history, rest days and weights first. Videos stored on this phone are never deleted by importing a backup.',
+      text: 'Found <b>' + d.workouts.length + '</b> workouts, <b>' + d.sessions.length + '</b> sessions, <b>' + d.rest.length + '</b> rest days, <b>' + d.weights.length + '</b> weight entries' + (r.skipped ? ' (' + r.skipped + ' invalid items skipped)' : '') + (d.videos.length ? ' and <b>' + d.videos.length + '</b> video records (details only, not the video files)' : '') + '.<br><br><b>Merge</b> adds them to what you have (same items are overwritten). <b>Replace</b> wipes your current workouts, history, rest days and weights first. Videos stored on this phone are never deleted by importing a backup.' + (Acct.user ? ' Your cloud account is not wiped either: records that exist only in the cloud come back at the next sync.' : ''),
       buttons: [{ label: 'Merge with current data', value: 'merge', cls: 'btn-primary' }, { label: 'Replace current data', value: 'replace', cls: 'btn-danger' }, { label: 'Cancel', value: 'cancel' }]
     });
     if (c !== 'merge' && c !== 'replace') return;
@@ -1341,8 +1403,9 @@
     } catch (e) { console.error(e); toast('Import failed. Your existing data was not fully changed.'); await loadAll(); rerender(); }
   }
   async function clearAll() {
-    const c = await confirmSheet({ title: 'Delete all data?', text: 'This permanently erases workouts, history, rest days, weights, playlist, saved videos and settings from this browser. Export a backup first if you might want it.', buttons: [{ label: 'Delete everything', value: 'yes', cls: 'btn-primary' }, { label: 'Cancel', value: 'no' }] });
+    const c = await confirmSheet({ title: 'Delete all data?', text: 'This permanently erases workouts, history, rest days, weights, playlist, saved videos and settings from this browser. ' + (Acct.user ? 'Your cloud account copy is NOT deleted; you will just be signed out on this phone. ' : '') + 'Export a backup first if you might want it.', buttons: [{ label: 'Delete everything', value: 'yes', cls: 'btn-primary' }, { label: 'Cancel', value: 'no' }] });
     if (c !== 'yes') return;
+    if (Acct.user) { if (Acct.engine) Acct.engine.detach(); try { await VWSCloud.signOut(); } catch (e) { console.error(e); } }
     try { for (const s of Object.keys(STORES)) await DB.clear(s); } catch (e) { console.error(e); }
     stopAndClear(); Player.files.clear();
     if (session) { session = null; closeOverlay(); }
@@ -1352,10 +1415,275 @@
     show('home'); toast('All app data deleted');
   }
 
+  /* ================= ACCOUNT & CLOUD SYNC ================= */
+  // Sign-in (Firebase Auth) and cloud copy (Cloud Firestore). Everything stays usable offline and without an
+  // account: the local database is always the source the screens read from; the cloud is a synced copy.
+  const Acct = { user: null, engine: null, mode: 'signin', msg: '', msgOk: false, busy: false, pendingName: '', sdkFailed: false, authStarted: false, paused: false, resolving: false, deferRender: false, compare: null };
+  const kvGet = async n => { const r = await DB.get('syncKv', n); return r ? r.v : null; };
+  const kvSet = (n, v) => DB.put('syncKv', { k: n, v: v });
+  const kvDel = k => DB.del('syncKv', k);
+  const kvList = async prefix => (await DB.getAll('syncKv')).filter(r => String(r.k).indexOf(prefix) === 0).map(r => ({ k: r.k, v: r.v }));
+  const syncHost = {
+    keyOf: (s, r) => r[STORES[s]],
+    listRecords: s => DB.getAll(s),
+    getRecord: (s, k) => DB.get(s, k),
+    applyRemote: items => DB.batch(SYNCED.concat(['sync']), o => {
+      items.forEach(i => {
+        if (i.deleted) o.del(i.store, i.key);
+        else { const rec = Object.assign({}, i.data); rec[STORES[i.store]] = i.key; o.put(i.store, rec); }
+        o.put('sync', { k: i.store + '|' + i.key, store: i.store, key: i.key, updatedAt: i.updatedAt, deleted: !!i.deleted, dirty: false });
+      });
+    }),
+    clearStore: s => DB.clear(s),
+    meta: { all: () => DB.getAll('sync'), putMany: a => DB.putMany('sync', a), put: m => DB.put('sync', m), del: k => DB.del('sync', k), clear: () => DB.clear('sync') },
+    kv: { get: kvGet, set: kvSet, del: kvDel, list: kvList },
+    onRemoteApplied: () => { refreshFromSync(); }
+  };
+  async function refreshFromSync() {
+    for (const s of SYNCED) { try { S[s] = await DB.getAll(s); } catch (e) { console.error(e); } }
+    const ae = document.activeElement;
+    if (ae && /^(INPUT|TEXTAREA|SELECT)$/.test(ae.tagName) && ae.closest && ae.closest('#app')) { Acct.deferRender = true; return; }   // never disturb typing
+    if (ui.tab) rerender();
+  }
+  document.addEventListener('focusout', () => { if (Acct.deferRender) { Acct.deferRender = false; setTimeout(() => { if (ui.tab) rerender(); }, 400); } });
+
+  const acctOpen = () => !!$('#acct-root');
+  function chipState() {
+    if (!window.VWSCloud || !VWSCloud.configured) return ['s-off', 'Cloud off'];
+    const cached = Prefs.get('acct', null);
+    if (!Acct.user) {
+      if (cached) return navigator.onLine === false || Acct.sdkFailed ? ['s-offline', 'Offline'] : ['s-syncing', 'Connecting…'];
+      return ['s-signin', 'Sign in'];
+    }
+    if (Acct.paused) return ['s-paused', 'Paused'];
+    if (navigator.onLine === false) return ['s-offline', 'Offline'];
+    const st = Acct.engine ? Acct.engine.status : 'idle';
+    if (st === 'synced') return ['s-synced', 'Synced'];
+    if (st === 'error') return ['s-error', 'Sync error'];
+    if (st === 'offline') return ['s-offline', 'Offline'];
+    return ['s-syncing', 'Syncing…'];
+  }
+  // R1: records that could not be synced are kept, counted and recoverable.
+  function skippedHTML() {
+    const sk = Acct.engine && Acct.engine.skipped;
+    if (!sk || !sk.total) return '';
+    return '<div class="acct-box" id="acct-skipped"><b>' + sk.total + ' record' + (sk.total === 1 ? '' : 's') + ' skipped</b>' +
+      '<p class="muted small" style="margin-top:6px">' + (sk.refused ? 'The cloud refused ' + sk.refused + ' of them. If you expected them to work, check that the latest firestore.rules is published, then tap Retry. ' : '') + 'These could not be synced (' + sk.out + ' on this phone, ' + sk.in + ' from the cloud). They have <b>not</b> been deleted or changed, and everything else syncs normally. Save a copy, then tap Retry (for example after an app update or after fixing the record).</p>' +
+      '<div class="stack"><button class="btn btn-ghost btn-block" data-action="acctSaveSkipped">Save skipped records (JSON)</button><button class="btn btn-ghost btn-block" data-action="acctRetrySkipped">Retry skipped records</button></div></div>';
+  }
+  function statusLine() {
+    const e = Acct.engine, cs = chipState();
+    let t = cs[1];
+    if (Acct.user && !Acct.paused && e) {
+      if (e.status === 'error' && e.detail) t = 'Sync error: ' + e.detail;
+      else if (cs[0] === 's-offline') t = 'Offline. Changes are saved on this phone and will upload automatically when you are back online.';
+      else if (cs[0] === 's-synced' && e.lastSyncedAt) t = 'Synced · ' + new Date(e.lastSyncedAt).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' });
+    }
+    if (Acct.paused) t = 'Paused. Your data has not been uploaded yet.';
+    const sk = e && e.skipped && e.skipped.total;
+    if (Acct.user && !Acct.paused && sk) t += ' · ' + sk + ' record' + (sk === 1 ? '' : 's') + ' skipped';
+    return t;
+  }
+  function updateChip() {
+    const chip = $('#sync-chip'); if (!chip) return;
+    const cs = chipState();
+    chip.className = 'sync-chip ' + cs[0];
+    $('#sync-chip-text').textContent = cs[1];
+    const el = $('#acct-status'); if (el) el.textContent = statusLine();
+  }
+  const acctName = () => (Acct.user && (Acct.user.displayName || '')) || '';
+
+  /* ---- Account sheet ---- */
+  function openAccount() { openSheet('<div id="acct-root"></div>'); renderAccount(); }
+  function renderAccount() {
+    const root = $('#acct-root'); if (!root) return;
+    const msg = Acct.msg ? '<p class="acct-msg ' + (Acct.msgOk ? 'ok' : '') + '" role="alert">' + esc(Acct.msg) + '</p>' : '';
+    let h = '<h3 class="sheet-title">Account &amp; cloud sync</h3>';
+    if (!window.VWSCloud || !VWSCloud.configured) {
+      h += '<div class="acct-box"><b>Cloud sync is not set up yet.</b><p class="muted small" style="margin-top:8px">This copy of the app is not connected to a Firebase project, so everything stays on this phone, exactly as before. To turn on accounts, follow <b>FIREBASE_SETUP.md</b> and paste your public Firebase web config into <b>firebase-config.js</b>.</p></div>' +
+        '<button class="btn btn-ghost btn-block" data-action="closeSheet">Close</button>';
+    } else if (Acct.user) {
+      const synced = !Acct.paused;
+      h += '<div class="acct-box"><div class="acct-name">' + esc(acctName() || 'No name yet') + '</div><div class="muted small" style="overflow-wrap:anywhere">' + esc(Acct.user.email || '') + '</div><div class="acct-status" id="acct-status">' + esc(statusLine()) + '</div></div>' + msg +
+        (Acct.paused ? '<button class="btn btn-primary btn-block" data-action="acctFinish">Finish setup: upload this phone’s data</button><div class="gap-top"></div>' : '') +
+        '<div class="stack">' + (synced ? '<button class="btn btn-primary btn-block" data-action="acctSyncNow">Sync now</button><button class="btn btn-ghost btn-block" data-action="acctCompare">Check my cloud copy</button>' : '') + '</div>' +
+        '<div id="acct-compare">' + compareHTML() + '</div>' + skippedHTML() + '<hr>' +
+        '<form data-form="acctName" novalidate><div class="field"><label for="a-name">Your name</label><input id="a-name" name="name" type="text" maxlength="60" autocomplete="name" value="' + esc(acctName()) + '"></div><button class="btn btn-ghost btn-block" type="submit">Save name</button></form><hr>' +
+        '<p class="muted small">Saved in your private account: workout history, every completed workout with its name, date and time, duration, rest days, weight history and your workout list. Streaks and totals are rebuilt from those records. Song and video files never leave this phone.</p>' +
+        '<button class="btn btn-ghost btn-block gap-top" data-action="acctSignOut">Sign out</button><button class="btn btn-ghost btn-block gap-top" data-action="closeSheet">Close</button>';
+    } else {
+      const cached = Prefs.get('acct', null), up = Acct.mode === 'signup';
+      h += (cached ? '<div class="acct-box"><b>Signed in as ' + esc(cached.displayName || cached.email || '') + '</b><p class="muted small" style="margin-top:6px">' + (navigator.onLine === false ? 'You are offline. ' : 'Connecting… ') + 'Your workouts are saved on this phone and will sync when the connection is back.</p></div>' : '') + msg +
+        '<div class="acct-tabs"><button class="btn btn-ghost ' + (up ? '' : 'on') + '" data-action="acctMode" data-mode="signin">Sign in</button><button class="btn btn-ghost ' + (up ? 'on' : '') + '" data-action="acctMode" data-mode="signup">Create account</button></div>' +
+        '<button class="btn btn-google btn-block" data-action="acctGoogle"' + (Acct.busy ? ' disabled' : '') + '>Continue with Google</button><button class="link-btn" data-action="acctGoogleRedirect">Google window not opening? Use full-page sign-in</button><div class="acct-or">OR WITH EMAIL</div>' +
+        '<form data-form="' + (up ? 'acctSignUp' : 'acctSignIn') + '" novalidate>' +
+        (up ? '<div class="field"><label for="a-name">Your name</label><input id="a-name" name="name" type="text" maxlength="60" autocomplete="name" required></div>' : '') +
+        '<div class="field"><label for="a-email">Email</label><input id="a-email" name="email" type="email" autocomplete="email" inputmode="email" required></div>' +
+        '<div class="field"><label for="a-pass">Password' + (up ? ' (6+ characters)' : '') + '</label><input id="a-pass" name="password" type="password" autocomplete="' + (up ? 'new-password' : 'current-password') + '" required></div>' +
+        '<button class="btn btn-primary btn-block" type="submit"' + (Acct.busy ? ' disabled' : '') + '>' + (Acct.busy ? 'Please wait…' : up ? 'Create account' : 'Sign in') + '</button></form>' +
+        (up ? '' : '<button class="link-btn" data-action="acctReset">Forgot password?</button>') +
+        '<p class="muted small">Signing in saves your workout history, rest days, weights and workout list to your private account so any phone you sign in on can restore them. It is optional. Song and video files stay on this phone.</p>' +
+        '<button class="btn btn-ghost btn-block gap-top" data-action="closeSheet">Close</button>';
+    }
+    root.innerHTML = h;
+  }
+  function compareHTML() {
+    const c = Acct.compare; if (!c) return '';
+    const lab = { workouts: 'Workouts', sessions: 'Completed workouts', rest: 'Rest days', weights: 'Weight entries' };
+    return '<table class="acct-table"><tr><th></th><th>This phone</th><th>Cloud</th></tr>' + SYNCED.map(s => '<tr><td>' + lab[s] + '</td><td>' + c.local[s] + '</td><td>' + (c.cloud ? c.cloud[s] : '…') + '</td></tr>').join('') + '</table>' + (c.error ? '<p class="acct-msg">' + esc(c.error) + '</p>' : '');
+  }
+  async function acctCompare() {
+    if (!Acct.engine || !Acct.user) return;
+    Acct.compare = { local: {}, cloud: null };
+    SYNCED.forEach(s => { Acct.compare.local[s] = S[s].length; });
+    const box = $('#acct-compare'); if (box) box.innerHTML = compareHTML();
+    try { Acct.compare.cloud = await Acct.engine.cloudCounts(); } catch (e) { Acct.compare.error = 'Could not read the cloud copy: ' + ((e && e.message) || e); }
+    const b2 = $('#acct-compare'); if (b2) b2.innerHTML = compareHTML();
+  }
+
+  /* ---- auth actions ---- */
+  async function acctDo(fn) {
+    if (Acct.busy) return;
+    Acct.busy = true; Acct.msg = ''; if (acctOpen()) renderAccount();
+    try { await fn(); } catch (e) { console.warn(e); Acct.msg = VWSCloud.friendlyAuthError(e); Acct.msgOk = false; }
+    Acct.busy = false;
+    if (acctOpen()) renderAccount();
+  }
+  function saveProfileQuiet() {
+    if (!Acct.engine || !Acct.engine.cloud || !Acct.user || !Acct.engine.cloud.saveProfile) return;
+    const goal = Prefs.get('goalMin', null);
+    Acct.engine.cloud.saveProfile({ displayName: acctName(), email: Acct.user.email, goalMin: typeof goal === 'number' ? goal : undefined }).catch(e => console.warn('Profile not saved yet', e));
+  }
+  async function restoreGoalFromProfile() {
+    try {
+      if (Prefs.get('goalMin', null) !== null || !Acct.engine.cloud.getProfile) return;
+      const p = await Acct.engine.cloud.getProfile();
+      if (p && typeof p.goalMin === 'number' && p.goalMin >= 5 && p.goalMin <= 600) { Prefs.set('goalMin', p.goalMin); rerender(); }
+    } catch (e) { /* optional */ }
+  }
+  async function onAuthUser(user) {
+    if (!user) {
+      Acct.user = null; Prefs.remove('acct'); Acct.paused = false; Acct.compare = null;
+      if (Acct.engine) Acct.engine.detach();
+      updateChip(); if (acctOpen()) renderAccount();
+      return;
+    }
+    if (!user.displayName && Acct.pendingName) user.displayName = Acct.pendingName;
+    Acct.user = user; Prefs.set('acct', { uid: user.uid, email: user.email, displayName: user.displayName });
+    Acct.engine.attach(VWSCloud.makeCloud(user.uid), user.uid);
+    updateChip();
+    await resolveOwner(user);
+    if (acctOpen()) renderAccount();
+  }
+  const countsText = c => [c.sessions + ' completed workout' + (c.sessions === 1 ? '' : 's'), c.workouts + ' saved workout' + (c.workouts === 1 ? '' : 's'), c.rest + ' rest day' + (c.rest === 1 ? '' : 's'), c.weights + ' weight entr' + (c.weights === 1 ? 'y' : 'ies')].join(', ');
+  async function resolveOwner(user) {
+    if (Acct.resolving) return;
+    Acct.resolving = true;
+    try {
+      const E = Acct.engine, owner = await kvGet('owner'), sum = await E.localSummary();
+      Acct.paused = false;
+      if (owner === user.uid) { E.enable(); saveProfileQuiet(); restoreGoalFromProfile(); E.syncNow(); return; }
+      if (!owner) {
+        if (sum.total === 0) {   // nothing on this phone: just load the account's data
+          await E.rebaseForNewOwner(); await kvSet('owner', user.uid);
+          E.enable(); saveProfileQuiet(); restoreGoalFromProfile(); E.syncNow({ full: true }); return;
+        }
+        if (Prefs.get('declined:' + user.uid, false)) { Acct.paused = true; E.pause(); return; }
+        await offerMigration(user, sum); return;
+      }
+      await offerSwitch(user, sum);
+    } finally { Acct.resolving = false; updateChip(); }
+  }
+  async function offerMigration(user, sum) {
+    const c = await confirmSheet({
+      title: 'Save this phone’s data to your account?',
+      text: 'This phone has <b>' + esc(countsText(sum.counts)) + '</b>. Signed in as <b>' + esc(user.email || acctName()) + '</b>.<br><br>The data is <b>copied</b> to your private account. Nothing on this phone is deleted or changed. After uploading, the app reads everything back from the cloud and checks it before it says “done”. If your account already has data, both are combined, and the same workout is never added twice. Song and video files stay on this phone.',
+      buttons: [{ label: 'Upload my data', value: 'yes', cls: 'btn-primary' }, { label: 'Not now', value: 'no' }]
+    });
+    if (c === 'yes') return runMigration(user);
+    if (c === 'no') Prefs.set('declined:' + user.uid, true);
+    Acct.paused = true; Acct.engine.pause(); updateChip();
+    toast('Cloud sync is paused. Open Account → Finish setup when you are ready.');
+  }
+  async function runMigration(user) {
+    openSheet('<h3 class="sheet-title">Uploading to your account…</h3><p class="muted" id="mig-status">Starting…</p><p class="muted small">Keep this page open until it finishes.</p>');
+    const r = await Acct.engine.migrate(m => { const el = $('#mig-status'); if (el) el.textContent = m; });
+    if (r.ok) {
+      await kvSet('owner', user.uid); Prefs.remove('declined:' + user.uid); Acct.paused = false;
+      Acct.engine.enable(); saveProfileQuiet(); restoreGoalFromProfile();
+      Acct.engine.syncNow();
+      await refreshFromSync();
+      openSheet('<h3 class="sheet-title">Your data is in your account</h3><p class="muted"><b>' + r.verified + '</b> record' + (r.verified === 1 ? '' : 's') + ' uploaded and verified by reading them back from the cloud. Everything on this phone is still here. From now on new workouts sync automatically.</p>' + (r.skipped ? '<p class="acct-msg"><b>' + r.skipped + ' record' + (r.skipped === 1 ? '' : 's') + ' skipped</b> because ' + (r.skipped === 1 ? 'it is' : 'they are') + ' not valid. ' + (r.skipped === 1 ? 'It is' : 'They are') + ' still on this phone, unchanged. You can save a copy or retry from Account.</p>' : '') + '<button class="btn btn-primary btn-block" data-action="closeSheet">Done</button>');
+    } else {
+      Acct.paused = true; Acct.engine.pause();
+      const why = r.reason === 'offline' ? 'You are offline. Connect to the internet and try again.' : r.reason === 'verify' ? 'The upload could not be verified (' + (r.missing || 0) + ' missing, ' + (r.mismatched || 0) + ' different). Your data on this phone is untouched. Please try again.' : 'Something went wrong: ' + esc(String(r.error || '')) + '. Your data on this phone is untouched.';
+      openSheet('<h3 class="sheet-title">Not finished</h3><p class="muted">' + why + '</p><button class="btn btn-primary btn-block" data-action="acctFinish">Try again</button><button class="btn btn-ghost btn-block gap-top" data-action="closeSheet">Close</button>');
+    }
+    updateChip();
+  }
+  async function offerSwitch(user, sum) {
+    const E = Acct.engine;
+    const c = await confirmSheet({
+      title: 'This phone has another account’s data',
+      text: 'The workout data on this phone was used with a different account. You are now signed in as <b>' + esc(user.email || acctName()) + '</b>. What should happen to the data on this phone?',
+      buttons: [{ label: 'Add it to this account too', value: 'keep', cls: 'btn-primary' }, { label: 'Replace it with this account’s data', value: 'clean' }, { label: 'Cancel and sign out', value: 'out' }]
+    });
+    if (c === 'keep') { await E.rebaseForNewOwner(); return runMigration(user); }
+    if (c === 'clean') {
+      if (sum.dirty > 0) {
+        const c2 = await confirmSheet({ title: 'Some changes were never uploaded', text: '<b>' + sum.dirty + '</b> change' + (sum.dirty === 1 ? '' : 's') + ' on this phone never reached the other account and would be lost. A backup file keeps them.', buttons: [{ label: 'Download backup, then replace', value: 'backup', cls: 'btn-primary' }, { label: 'Replace without a backup', value: 'go' }, { label: 'Cancel and sign out', value: 'out' }] });
+        if (c2 === 'backup') exportData(); else if (c2 !== 'go') { await doSignOut(true); return; }
+      }
+      await E.wipeLocalSynced(); await kvSet('owner', user.uid);
+      E.enable(); saveProfileQuiet(); restoreGoalFromProfile(); await E.syncNow({ full: true }); await refreshFromSync();
+      toast('Loaded this account’s data'); return;
+    }
+    await doSignOut(true);
+  }
+  async function doSignOut(quiet) {
+    try {
+      if (Acct.engine && Acct.engine.enabled && navigator.onLine !== false) await Promise.race([Acct.engine.syncNow(), new Promise(r => setTimeout(r, 6000))]);
+    } catch (e) { /* signing out must always work */ }
+    try { await VWSCloud.signOut(); } catch (e) { console.error(e); }
+    if (!quiet) toast('Signed out. Your data is still on this phone and in your account.');
+  }
+  async function initAccount() {
+    if (!window.VWSSync || !window.VWSCloud) return;
+    Acct.engine = VWSSync.createEngine(syncHost);
+    Acct.engine.onChange(() => updateChip());
+    DB.onLocalChange = () => Acct.engine.kick();
+    window.addEventListener('online', () => { if (!Acct.authStarted) { Acct.sdkFailed = false; startAuth(); } if (Acct.engine.enabled) Acct.engine.syncNow(); updateChip(); });
+    window.addEventListener('offline', updateChip);
+    document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && Acct.engine.enabled) Acct.engine.syncNow(); });
+    setInterval(() => { if (document.visibilityState === 'visible' && Acct.engine.enabled) Acct.engine.syncNow(); }, 90000);
+    updateChip();
+    startAuth();
+  }
+  function startAuth() {
+    if (!VWSCloud.configured || Acct.authStarted) return;
+    Acct.authStarted = true;
+    VWSCloud.onAuth(u => { onAuthUser(u).catch(e => console.error(e)); }).then(() => {
+      const re = VWSCloud.takeRedirectError();      // a full-page Google sign-in that came back with an error
+      if (re) { Acct.msg = VWSCloud.friendlyAuthError(re); Acct.msgOk = false; toast(Acct.msg); }
+    }).catch(e => { console.warn('Cloud sign-in unavailable', e); Acct.authStarted = false; Acct.sdkFailed = true; updateChip(); });
+  }
+
   /* ================= EVENTS ================= */
   const actions = {
     nav: d => show(d.tab),
     openSettings: openSettings,
+    openAccount: openAccount,
+    acctMode: d => { Acct.mode = d.mode === 'signup' ? 'signup' : 'signin'; Acct.msg = ''; renderAccount(); },
+    acctGoogle: () => acctDo(async () => { const r = await VWSCloud.signInGoogle(); if (r && r.redirecting) { Acct.msg = 'Opening Google sign-in…'; Acct.msgOk = true; } }),
+    acctGoogleRedirect: () => acctDo(async () => { const r = await VWSCloud.signInGoogle({ redirect: true }); if (r && r.redirecting) { Acct.msg = 'Opening Google sign-in…'; Acct.msgOk = true; } }),
+    acctSignOut: async () => { const c = await confirmSheet({ title: 'Sign out?', text: 'Your workouts stay on this phone and in your account. Sign in again any time to keep syncing.', buttons: [{ label: 'Sign out', value: 'yes', cls: 'btn-primary' }, { label: 'Cancel', value: 'no' }] }); if (c === 'yes') doSignOut(false); },
+    acctSyncNow: async () => { if (!Acct.engine || !Acct.engine.enabled) return; const r = await Acct.engine.syncNow(); if (r && r.offline) toast('You are offline. It will sync when you are back online.'); else if (r && r.error) toast('Sync problem: ' + statusLine()); else toast('Synced'); },
+    acctCompare: acctCompare,
+    acctSaveSkipped: async () => { if (!Acct.engine) return; try { const x = await Acct.engine.exportQuarantine(); saveJson(x, 'vishesh-skipped-records-' + todayStr() + '.json'); toast('Saved ' + x.count + ' skipped record' + (x.count === 1 ? '' : 's') + '.'); } catch (e) { console.error(e); toast('Could not save the skipped records.'); } },
+    acctRetrySkipped: async () => { if (!Acct.engine || !Acct.engine.enabled) return; const r = await Acct.engine.retryQuarantine(); const n = Acct.engine.skipped.total; toast(r && r.error ? 'Sync problem: ' + statusLine() : (n ? n + ' still skipped.' : 'All records synced.')); if (acctOpen()) renderAccount(); },
+    downloadSafetyCopy: downloadSafetyCopy,
+    acctFinish: async () => { if (Acct.user) { Acct.engine.attach(VWSCloud.makeCloud(Acct.user.uid), Acct.user.uid); Prefs.remove('declined:' + Acct.user.uid); const sum = await Acct.engine.localSummary(); await runMigration(Acct.user); } },
+    acctReset: () => acctDo(async () => { const el = $('#a-email'); const em = el ? el.value.trim() : ''; if (!em) { Acct.msg = 'Type your email above first, then tap Forgot password.'; return; } await VWSCloud.resetPassword(em); Acct.msg = 'If that email has an account, a reset link is on its way.'; Acct.msgOk = true; }),
     closeSheet: () => { if (Imp.running) { toast('Import in progress. Tap “Cancel import” to stop it.'); return; } closeSheet(); },
     wSub: d => { ui.wSub = d.sub === 'videos' ? 'videos' : 'workouts'; renderWorkouts(); },
     importVideo: () => {
@@ -1447,12 +1775,24 @@
     e.preventDefault();
     if (f.dataset.form === 'workout') saveWorkoutForm(f);
     else if (f.dataset.form === 'weight') saveWeight(f);
+    else if (f.dataset.form === 'acctSignIn') { const d = new FormData(f); acctDo(() => VWSCloud.signInEmail(String(d.get('email') || '').trim(), String(d.get('password') || ''))); }
+    else if (f.dataset.form === 'acctSignUp') {
+      const d = new FormData(f), name = String(d.get('name') || '').trim(), em = String(d.get('email') || '').trim(), pw = String(d.get('password') || '');
+      if (!name) { Acct.msg = 'Please enter your name.'; Acct.msgOk = false; renderAccount(); return; }
+      Acct.pendingName = name;
+      acctDo(async () => { const u = await VWSCloud.signUpEmail(name, em, pw); if (Acct.user && !Acct.user.displayName) { Acct.user.displayName = name; Prefs.set('acct', { uid: Acct.user.uid, email: Acct.user.email, displayName: name }); } saveProfileQuiet(); });
+    }
+    else if (f.dataset.form === 'acctName') {
+      const nm = String(new FormData(f).get('name') || '').trim();
+      if (!nm) { toast('Name cannot be empty'); return; }
+      acctDo(async () => { const u = await VWSCloud.updateName(nm); Acct.user.displayName = u.displayName; Prefs.set('acct', { uid: Acct.user.uid, email: Acct.user.email, displayName: u.displayName }); saveProfileQuiet(); Acct.msg = 'Name saved.'; Acct.msgOk = true; });
+    }
     else if (f.dataset.form === 'importVideo') runImport(f);
     else if (f.dataset.form === 'renameVideo') saveRename(f);
     else if (f.dataset.form === 'settings') {
       const g = parseInt(new FormData(f).get('goal'), 10);
       if (!(g >= 5 && g <= 600)) { toast('Goal must be 5–600 minutes'); return; }
-      Prefs.set('goalMin', g); toast('Goal saved'); rerender();
+      Prefs.set('goalMin', g); toast('Goal saved'); rerender(); saveProfileQuiet();
     }
   });
   document.addEventListener('input', e => {
@@ -1494,6 +1834,7 @@
   async function boot() {
     buildNav();
     await DB.open();
+    if (DB.versionError) { showNewerVersionNeeded(); return; }   // R2: stop here. Nothing is read, written or synced.
     await loadAll();
     await cleanOrphanChunks();   // remove pieces of an import that was interrupted
     const restored = C.restoreSession(Prefs.get('active', null), Date.now());
@@ -1508,6 +1849,70 @@
     }
     if (DB.memory) toast('Browser storage is unavailable, so data will not be saved.');
     registerSW();
+    initAccount();
+    snapshotAfterUpgrade();
+  }
+  /* ---- R2: the on-phone database is newer than this copy of the app ---- */
+  function showNewerVersionNeeded() {
+    const l = $('#loading'); if (!l) return;
+    l.className = 'loading newer-needed';
+    l.innerHTML = '<div class="acct-box" style="max-width:420px;margin:24px auto;text-align:left"><h3 style="margin:0 0 8px">A newer version of the app is needed</h3>' +
+      '<p>Your saved data on this phone was created by a newer version of Vishesh Workout Studio than the one that is open now. ' +
+      'To keep your data safe, this version has <b>not opened it and has not changed anything</b>.</p>' +
+      '<p>Your workouts, history, songs and videos are still on this phone. Tap <b>Update now</b>; if that does not help, close the app completely and open it again while online.</p>' +
+      '<div class="stack"><button class="btn btn-primary btn-block" id="nv-update">Update now</button><button class="btn btn-ghost btn-block" id="nv-reload">Reload</button></div><p class="muted small" id="nv-msg"></p></div>';
+    const msg = t => { const m = $('#nv-msg'); if (m) m.textContent = t; };
+    $('#nv-reload').addEventListener('click', () => location.reload());
+    $('#nv-update').addEventListener('click', async () => {
+      msg('Checking for the newest version…');
+      try {
+        const reg = await navigator.serviceWorker.getRegistration();
+        if (reg) { await reg.update(); msg('If a new version was found it will load now. Reloading…'); setTimeout(() => location.reload(), 1500); }
+        else location.reload();
+      } catch (e) { msg('Could not check right now. Connect to the internet and try again.'); }
+    });
+    try { if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {}); } catch (e) { /* ignore */ }
+  }
+  /* ---- R2: one-time safety copy right after the v2 -> v3 upgrade (its own small database; never touches the main one) ---- */
+  const SNAP_DB = 'vws-safety-snapshot';
+  function snapOpen() {
+    return new Promise((res, rej) => {
+      const r = indexedDB.open(SNAP_DB, 1);
+      r.onupgradeneeded = () => { if (!r.result.objectStoreNames.contains('snap')) r.result.createObjectStore('snap', { keyPath: 'id' }); };
+      r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+    });
+  }
+  async function snapshotAfterUpgrade() {
+    try {
+      if (DB.memory || !DB.db || !(DB.upgradedFrom >= 1 && DB.upgradedFrom < 3)) return;
+      const snap = { id: 'before-v3', at: Date.now(), from: DB.upgradedFrom, workouts: S.workouts, sessions: S.sessions, rest: S.rest, weights: S.weights,
+        tracks: S.tracks.map(t => trackRecord(t, false)), videos: S.videos.map(v => ({ id: v.id, title: v.title, fileName: v.fileName, size: v.size, mime: v.mime, durationSec: v.durationSec, category: v.category, importedAt: v.importedAt })) };
+      const db = await snapOpen();
+      const have = await new Promise(res => { const q = db.transaction('snap').objectStore('snap').get('before-v3'); q.onsuccess = () => res(q.result); q.onerror = () => res(null); });
+      if (!have) await new Promise((res, rej) => { const t = db.transaction('snap', 'readwrite'); t.objectStore('snap').put(snap); t.oncomplete = res; t.onerror = () => rej(t.error); });
+      db.close();
+    } catch (e) { console.warn('safety copy not written', e); }
+  }
+  async function downloadSafetyCopy() {
+    try {
+      const db = await snapOpen();
+      const snap = await new Promise(res => { const q = db.transaction('snap').objectStore('snap').get('before-v3'); q.onsuccess = () => res(q.result); q.onerror = () => res(null); });
+      db.close();
+      if (!snap) { toast('No pre-update safety copy exists on this phone.'); return; }
+      // NOT a media backup: song and video FILES are not in it. Their names are listed under "mediaNotIncluded" only for
+      // reference, and deliberately not under "tracks"/"videos", so importing this file can not create empty song/video entries.
+      const payload = { app: 'vishesh-workout-studio', version: 2, exportedAt: new Date(snap.at).toISOString(), prefs: { dailyGoalMin: Prefs.get('goalMin', 30) },
+        note: 'Automatic safety copy taken when storage was upgraded to version 3. Contains workouts, sessions, rest days and weights ONLY. Song and video files are NOT included; they were not touched and stay inside the app on the phone.',
+        workouts: snap.workouts, sessions: snap.sessions, rest: snap.rest, weights: snap.weights,
+        mediaNotIncluded: { songs: (snap.tracks || []).map(t => t.name), videos: (snap.videos || []).map(v => v.title || v.fileName) } };
+      saveJson(payload, 'vishesh-workout-safety-copy-' + todayStr() + '.json'); toast('Safety copy downloaded. It has no song or video files.');
+    } catch (e) { console.error(e); toast('Could not read the safety copy.'); }
+  }
+  function saveJson(obj, name) {
+    const blob = new Blob([JSON.stringify(obj, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob), a = document.createElement('a');
+    a.href = url; a.download = name; document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 15000);
   }
   boot().catch(e => {
     console.error(e);
