@@ -11,11 +11,11 @@
 window.VWS_FIREBASE = {
   sdkVersion: '10.14.1',   // Firebase JS SDK version loaded from Google's CDN (www.gstatic.com/firebasejs)
   config: {
-    apiKey: '',
-    authDomain: '',
-    projectId: '',
-    storageBucket: '',
-    messagingSenderId: '',
-    appId: ''
+    apiKey: 'AIzaSyCPN1_u91dROw5Y21ernKVzPW3S_Ox39j4',
+    authDomain: 'vishesh-workout-studio.firebaseapp.com',
+    projectId: 'vishesh-workout-studio',
+    storageBucket: 'vishesh-workout-studio.firebasestorage.app',
+    messagingSenderId: '373610231295',
+    appId: '1:373610231295:web:2367d4f28843a7ccf0e3ca'
   }
 };
