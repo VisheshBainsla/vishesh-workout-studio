@@ -374,3 +374,24 @@ input[type="date"] { min-width: 0; }
 .link-btn { background: none; border: 0; color: var(--red2); font-weight: 700; padding: 10px 0; min-height: 44px; text-decoration: underline; }
 .acct-table { width: 100%; font-size: 13px; border-collapse: collapse; margin-top: 8px; }
 .acct-table td, .acct-table th { padding: 6px 4px; text-align: left; border-bottom: 1px solid var(--line); }
+
+/* ---------- login gate (Phase 1) ---------- */
+body.gated .topbar, body.gated #app, body.gated #nav, body.gated #session { display: none !important; }
+body:not(.gated) #gate { display: none !important; }
+.gate { min-height: 100vh; min-height: 100dvh; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 22px; padding: calc(24px + var(--safe-t)) 16px calc(24px + var(--safe-b)); }
+.gate[hidden] { display: none; }
+.gate-brand { display: flex; align-items: center; gap: 12px; }
+.gate-brand .brand-mark { width: 46px; height: 46px; font-size: 24px; }
+.gate-card { width: 100%; max-width: 420px; background: var(--card); border: 1px solid var(--line); border-radius: 22px; padding: 22px 18px; box-shadow: 0 20px 60px rgba(0, 0, 0, .55), 0 0 0 1px rgba(225, 29, 46, .08); text-align: left; }
+.gate-card .gate-title { font-size: 22px; font-weight: 800; letter-spacing: .2px; margin-bottom: 6px; }
+.gate-card .gate-sub { color: var(--muted); font-size: 14px; margin-bottom: 18px; }
+.gate-card .acct-tabs { margin-top: 2px; }
+.gate-card .btn-block + .btn-block { margin-top: 10px; }
+.gate-state { text-align: center; }
+.gate-state .gate-title { text-align: center; }
+.gate-state p { color: var(--muted); font-size: 14px; margin: 8px 0 0; }
+.gate-state .btn { margin-top: 16px; }
+.gate-spinner { width: 34px; height: 34px; margin: 4px auto 14px; border-radius: 50%; border: 3px solid var(--line); border-top-color: var(--red2); animation: gate-spin .9s linear infinite; }
+@keyframes gate-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .gate-spinner { animation-duration: 2.4s; } }
+.gate.newer-needed .acct-box { margin: 0; }

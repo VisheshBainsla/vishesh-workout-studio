@@ -1415,10 +1415,92 @@
     show('home'); toast('All app data deleted');
   }
 
+
+  /* ================= LOGIN GATE (Phase 1) =================
+   * The dashboard is shown only after Firebase has reported a signed-in user. Firebase's own first
+   * onAuthStateChanged result is the only proof used: Prefs "acct" is just a display cache and never unlocks anything.
+   * The page is "gated" by default (body.gated in index.html), so if this code fails the dashboard stays hidden.
+   * Nothing here touches IndexedDB, localStorage data, owner uid or sync metadata. */
+  const Gate = { state: 'loading', resolved: false, dash: false, timer: null, redirectDone: null };
+  const gateEl = () => $('#gate');
+  // The only actions that work while the login page is showing (hidden dashboard buttons can not be triggered by script either).
+  const GATE_ACTIONS = { acctMode: 1, acctGoogle: 1, acctGoogleRedirect: 1, acctReset: 1, gateRetry: 1, sheetChoice: 1, closeSheet: 1, acctFinish: 1, applyUpdate: 1, dismissUpdate: 1 };
+  const REDIRECT_FLAG = 'vws.gate.redirect';
+  const redirectPending = () => { try { const t = Number(sessionStorage.getItem(REDIRECT_FLAG)); if (t > 0 && Date.now() - t < 10 * 60 * 1000) return true; for (let i = 0; i < sessionStorage.length; i++) if (/pendingRedirect/i.test(sessionStorage.key(i))) return true; return false; } catch (e) { return false; } };   // 2nd check: Firebase's own marker (not verified on a real device)
+  const markRedirect = on => { try { if (on) sessionStorage.setItem(REDIRECT_FLAG, String(Date.now())); else sessionStorage.removeItem(REDIRECT_FLAG); } catch (e) { /* ignore */ } };
+  function gateBrand() { return '<div class="gate-brand"><span class="brand-mark">V</span><div class="brand-text"><b>VISHESH</b><span>WORKOUT STUDIO</span></div></div>'; }
+  const GATE_ERR = {
+    unconfigured: ['Sign-in is not set up', 'This copy of the app is not connected to a sign-in service, so the dashboard stays locked. If you own this app, add your Firebase settings (see FIREBASE_SETUP.md) and publish again.', 'Reload'],
+    missing: ['Sign-in files did not load', 'Part of the app (the sign-in code) could not be loaded, so the dashboard stays locked. Check your connection and reload.', 'Reload'],
+    sdk: ['Could not reach the sign-in service', 'The sign-in service could not be loaded. If you are offline, connect to the internet once and try again. The dashboard stays locked until sign-in can be checked.', 'Try again'],
+    slow: ['Still checking your sign-in…', 'This is taking longer than usual. Check your internet connection, then try again. The dashboard stays locked until your sign-in is verified.', 'Try again'],
+    boot: ['Something went wrong while starting the app', 'Try reloading the page. Nothing was deleted.', 'Reload']
+  };
+  function setGate(state, o) {
+    o = o || {};
+    const g = gateEl(); if (!g) return;
+    const wasDash = Gate.dash && Gate.state === 'off';
+    Gate.state = state; g.hidden = false; g.dataset.state = state; g.className = 'gate';
+    document.body.classList.add('gated');
+    if (wasDash) {                                   // leaving the dashboard (sign-out): stop sound, close sheets, nothing else
+      try { if (Player && Player.audio) Player.audio.pause(); } catch (e) { /* ignore */ }
+      if (!Imp.running && $('#sheet') && !$('#sheet').hidden) closeSheet();
+    }
+    if (state === 'login') {
+      g.innerHTML = gateBrand() + '<div class="gate-card"><h1 class="gate-title">Welcome</h1><p class="gate-sub">Sign in or create an account to open your workout studio. Your workouts, history and weights are saved to your private account.</p><div id="acct-root" data-gate="1"></div></div>';
+      renderAccount();
+    } else if (state === 'error') {
+      const e = GATE_ERR[o.kind] || GATE_ERR.boot;
+      g.innerHTML = gateBrand() + '<div class="gate-card gate-state"><h1 class="gate-title">' + esc(e[0]) + '</h1><p>' + esc(e[1]) + '</p><p>Your workouts are safe on this phone. Nothing was deleted.</p><button class="btn btn-primary btn-block" data-action="gateRetry">' + esc(e[2]) + '</button></div>';
+    } else {
+      g.innerHTML = gateBrand() + '<div class="gate-card gate-state"><div class="gate-spinner" aria-hidden="true"></div><p class="gate-title">' + esc(o.text || 'Checking your sign-in…') + '</p></div>';
+    }
+  }
+  function gateWatch() {
+    clearTimeout(Gate.timer);
+    Gate.timer = setTimeout(() => { if (!Gate.resolved) setGate('error', { kind: 'slow' }); }, 12000);
+  }
+  // First time the dashboard is allowed to appear: do what boot() used to do right after loading the data.
+  function revealDashboard() {
+    if (Gate.state === 'off') return;
+    Gate.state = 'off';
+    const g = gateEl(); if (g) { g.hidden = true; g.innerHTML = ''; }
+    document.body.classList.remove('gated');
+    if (!Gate.dash) {
+      Gate.dash = true;
+      const l = $('#loading'); if (l) l.remove();
+      show(Prefs.get('tab', 'home'));
+      if (session) {
+        openOverlay();
+        if (session.restoredPaused) { toast('Session restored. Your timer is paused at ' + C.fmtClock(session.accumMs / 1000) + '. Tap RESUME when you are ready.'); delete session.restoredPaused; persistSession(); }
+      }
+      if (DB.memory) toast('Browser storage is unavailable, so data will not be saved.');
+    } else show(ui.tab);
+  }
+  // Called for EVERY Firebase auth-state callback (the first one is the authoritative start-up answer).
+  function onAuthEvent(u) {
+    const first = !Gate.resolved;
+    Gate.resolved = true; clearTimeout(Gate.timer);
+    const done = () => { if (Acct.user && !Acct.resolving) revealDashboard(); };
+    if (u) {
+      markRedirect(false);
+      if (Gate.state !== 'off') setGate('loading', { text: 'Signing you in…' });
+      onAuthUser(u).then(done, e => { console.error(e); done(); });
+      return;
+    }
+    onAuthUser(null).catch(e => console.error(e));
+    if (first && redirectPending()) {                 // returning from a full-page Google sign-in: wait for Firebase to finish it
+      setGate('loading', { text: 'Finishing Google sign-in…' });
+      Promise.race([Gate.redirectDone || Promise.resolve(), new Promise(r => setTimeout(r, 8000))]).then(() => new Promise(r => setTimeout(r, 900))).then(() => { markRedirect(false); if (!Acct.user && Gate.state !== 'off') setGate('login'); });
+      return;
+    }
+    setGate('login');
+  }
+
   /* ================= ACCOUNT & CLOUD SYNC ================= */
   // Sign-in (Firebase Auth) and cloud copy (Cloud Firestore). Everything stays usable offline and without an
   // account: the local database is always the source the screens read from; the cloud is a synced copy.
-  const Acct = { user: null, engine: null, mode: 'signin', msg: '', msgOk: false, busy: false, pendingName: '', sdkFailed: false, authStarted: false, paused: false, resolving: false, deferRender: false, compare: null };
+  const Acct = { user: null, engine: null, mode: 'signin', msg: '', msgOk: false, busy: false, pendingName: '', sdkFailed: false, authStarted: false, paused: false, resolving: false, deferRender: false, compare: null, draft: { email: '', name: '' } };
   const kvGet = async n => { const r = await DB.get('syncKv', n); return r ? r.v : null; };
   const kvSet = (n, v) => DB.put('syncKv', { k: n, v: v });
   const kvDel = k => DB.del('syncKv', k);
@@ -1497,8 +1579,11 @@
   function openAccount() { openSheet('<div id="acct-root"></div>'); renderAccount(); }
   function renderAccount() {
     const root = $('#acct-root'); if (!root) return;
+    const gate = root.dataset.gate === '1';          // the full-screen login page reuses this same form
+    const de = $('#a-email'), dn = $('#a-name');       // keep what was typed when the form is redrawn (busy / error states)
+    if (de && !Acct.user) Acct.draft.email = de.value; if (dn && !Acct.user) Acct.draft.name = dn.value;
     const msg = Acct.msg ? '<p class="acct-msg ' + (Acct.msgOk ? 'ok' : '') + '" role="alert">' + esc(Acct.msg) + '</p>' : '';
-    let h = '<h3 class="sheet-title">Account &amp; cloud sync</h3>';
+    let h = gate ? '' : '<h3 class="sheet-title">Account &amp; cloud sync</h3>';
     if (!window.VWSCloud || !VWSCloud.configured) {
       h += '<div class="acct-box"><b>Cloud sync is not set up yet.</b><p class="muted small" style="margin-top:8px">This copy of the app is not connected to a Firebase project, so everything stays on this phone, exactly as before. To turn on accounts, follow <b>FIREBASE_SETUP.md</b> and paste your public Firebase web config into <b>firebase-config.js</b>.</p></div>' +
         '<button class="btn btn-ghost btn-block" data-action="closeSheet">Close</button>';
@@ -1513,17 +1598,17 @@
         '<button class="btn btn-ghost btn-block gap-top" data-action="acctSignOut">Sign out</button><button class="btn btn-ghost btn-block gap-top" data-action="closeSheet">Close</button>';
     } else {
       const cached = Prefs.get('acct', null), up = Acct.mode === 'signup';
-      h += (cached ? '<div class="acct-box"><b>Signed in as ' + esc(cached.displayName || cached.email || '') + '</b><p class="muted small" style="margin-top:6px">' + (navigator.onLine === false ? 'You are offline. ' : 'Connecting… ') + 'Your workouts are saved on this phone and will sync when the connection is back.</p></div>' : '') + msg +
+      h += (cached && !gate ? '<div class="acct-box"><b>Signed in as ' + esc(cached.displayName || cached.email || '') + '</b><p class="muted small" style="margin-top:6px">' + (navigator.onLine === false ? 'You are offline. ' : 'Connecting… ') + 'Your workouts are saved on this phone and will sync when the connection is back.</p></div>' : '') + msg +
         '<div class="acct-tabs"><button class="btn btn-ghost ' + (up ? '' : 'on') + '" data-action="acctMode" data-mode="signin">Sign in</button><button class="btn btn-ghost ' + (up ? 'on' : '') + '" data-action="acctMode" data-mode="signup">Create account</button></div>' +
         '<button class="btn btn-google btn-block" data-action="acctGoogle"' + (Acct.busy ? ' disabled' : '') + '>Continue with Google</button><button class="link-btn" data-action="acctGoogleRedirect">Google window not opening? Use full-page sign-in</button><div class="acct-or">OR WITH EMAIL</div>' +
         '<form data-form="' + (up ? 'acctSignUp' : 'acctSignIn') + '" novalidate>' +
-        (up ? '<div class="field"><label for="a-name">Your name</label><input id="a-name" name="name" type="text" maxlength="60" autocomplete="name" required></div>' : '') +
-        '<div class="field"><label for="a-email">Email</label><input id="a-email" name="email" type="email" autocomplete="email" inputmode="email" required></div>' +
+        (up ? '<div class="field"><label for="a-name">Your name</label><input id="a-name" name="name" type="text" maxlength="60" autocomplete="name" required value="' + esc(Acct.draft.name) + '"></div>' : '') +
+        '<div class="field"><label for="a-email">Email</label><input id="a-email" name="email" type="email" autocomplete="email" inputmode="email" required value="' + esc(Acct.draft.email) + '"></div>' +
         '<div class="field"><label for="a-pass">Password' + (up ? ' (6+ characters)' : '') + '</label><input id="a-pass" name="password" type="password" autocomplete="' + (up ? 'new-password' : 'current-password') + '" required></div>' +
         '<button class="btn btn-primary btn-block" type="submit"' + (Acct.busy ? ' disabled' : '') + '>' + (Acct.busy ? 'Please wait…' : up ? 'Create account' : 'Sign in') + '</button></form>' +
         (up ? '' : '<button class="link-btn" data-action="acctReset">Forgot password?</button>') +
-        '<p class="muted small">Signing in saves your workout history, rest days, weights and workout list to your private account so any phone you sign in on can restore them. It is optional. Song and video files stay on this phone.</p>' +
-        '<button class="btn btn-ghost btn-block gap-top" data-action="closeSheet">Close</button>';
+        '<p class="muted small">' + (gate ? 'Signing in saves' : 'Signing in saves') + ' your workout history, rest days, weights and workout list to your private account so any phone you sign in on can restore them. ' + (gate ? '' : 'It is optional. ') + 'Song and video files stay on this phone.</p>' +
+        (gate ? '' : '<button class="btn btn-ghost btn-block gap-top" data-action="closeSheet">Close</button>');
     }
     root.innerHTML = h;
   }
@@ -1662,10 +1747,13 @@
   function startAuth() {
     if (!VWSCloud.configured || Acct.authStarted) return;
     Acct.authStarted = true;
-    VWSCloud.onAuth(u => { onAuthUser(u).catch(e => console.error(e)); }).then(() => {
+    if (!Gate.resolved && Gate.state === 'error') { setGate('loading'); gateWatch(); }
+    let redirectSettled; Gate.redirectDone = new Promise(r => { redirectSettled = r; });
+    VWSCloud.onAuth(u => { onAuthEvent(u); }).then(() => {
       const re = VWSCloud.takeRedirectError();      // a full-page Google sign-in that came back with an error
-      if (re) { Acct.msg = VWSCloud.friendlyAuthError(re); Acct.msgOk = false; toast(Acct.msg); }
-    }).catch(e => { console.warn('Cloud sign-in unavailable', e); Acct.authStarted = false; Acct.sdkFailed = true; updateChip(); });
+      if (re) { Acct.msg = VWSCloud.friendlyAuthError(re); Acct.msgOk = false; toast(Acct.msg); if (Gate.state === 'login') renderAccount(); }
+      redirectSettled();
+    }).catch(e => { console.warn('Cloud sign-in unavailable', e); Acct.authStarted = false; Acct.sdkFailed = true; updateChip(); redirectSettled(); if (!Gate.resolved) setGate('error', { kind: 'sdk' }); });
   }
 
   /* ================= EVENTS ================= */
@@ -1674,9 +1762,10 @@
     openSettings: openSettings,
     openAccount: openAccount,
     acctMode: d => { Acct.mode = d.mode === 'signup' ? 'signup' : 'signin'; Acct.msg = ''; renderAccount(); },
-    acctGoogle: () => acctDo(async () => { const r = await VWSCloud.signInGoogle(); if (r && r.redirecting) { Acct.msg = 'Opening Google sign-in…'; Acct.msgOk = true; } }),
-    acctGoogleRedirect: () => acctDo(async () => { const r = await VWSCloud.signInGoogle({ redirect: true }); if (r && r.redirecting) { Acct.msg = 'Opening Google sign-in…'; Acct.msgOk = true; } }),
-    acctSignOut: async () => { const c = await confirmSheet({ title: 'Sign out?', text: 'Your workouts stay on this phone and in your account. Sign in again any time to keep syncing.', buttons: [{ label: 'Sign out', value: 'yes', cls: 'btn-primary' }, { label: 'Cancel', value: 'no' }] }); if (c === 'yes') doSignOut(false); },
+    acctGoogle: () => { markRedirect(true); return acctDo(async () => { try { const r = await VWSCloud.signInGoogle(); if (r && r.redirecting) { Acct.msg = 'Opening Google sign-in…'; Acct.msgOk = true; } else markRedirect(false); } catch (e) { markRedirect(false); throw e; } }); },   // flag is set BEFORE the call: if the page leaves for Google, the flag is still there when it comes back
+    acctGoogleRedirect: () => { markRedirect(true); return acctDo(async () => { try { const r = await VWSCloud.signInGoogle({ redirect: true }); if (r && r.redirecting) { Acct.msg = 'Opening Google sign-in…'; Acct.msgOk = true; } else markRedirect(false); } catch (e) { markRedirect(false); throw e; } }); },
+    gateRetry: () => location.reload(),   // safe: reloading never touches stored data; a failed SDK import is only retried on a fresh page load
+    acctSignOut: async () => { if (session) { toast('Finish or end your running workout before signing out.'); return; } const c = await confirmSheet({ title: 'Sign out?', text: 'Your workouts stay on this phone and in your account. Sign in again any time to keep syncing.', buttons: [{ label: 'Sign out', value: 'yes', cls: 'btn-primary' }, { label: 'Cancel', value: 'no' }] }); if (c === 'yes') doSignOut(false); },
     acctSyncNow: async () => { if (!Acct.engine || !Acct.engine.enabled) return; const r = await Acct.engine.syncNow(); if (r && r.offline) toast('You are offline. It will sync when you are back online.'); else if (r && r.error) toast('Sync problem: ' + statusLine()); else toast('Synced'); },
     acctCompare: acctCompare,
     acctSaveSkipped: async () => { if (!Acct.engine) return; try { const x = await Acct.engine.exportQuarantine(); saveJson(x, 'vishesh-skipped-records-' + todayStr() + '.json'); toast('Saved ' + x.count + ' skipped record' + (x.count === 1 ? '' : 's') + '.'); } catch (e) { console.error(e); toast('Could not save the skipped records.'); } },
@@ -1766,6 +1855,7 @@
   document.addEventListener('click', e => {
     const el = e.target.closest('[data-action]');
     if (!el || el.disabled) return;
+    if (document.body.classList.contains('gated') && !GATE_ACTIONS[el.dataset.action]) return;   // while signed out only sign-in actions work
     const fn = actions[el.dataset.action];
     if (fn) { e.preventDefault(); fn(el.dataset, el); }
   });
@@ -1773,6 +1863,7 @@
     const f = e.target.closest('form[data-form]');
     if (!f) return;
     e.preventDefault();
+    if (document.body.classList.contains('gated') && f.dataset.form !== 'acctSignIn' && f.dataset.form !== 'acctSignUp') return;
     if (f.dataset.form === 'workout') saveWorkoutForm(f);
     else if (f.dataset.form === 'weight') saveWeight(f);
     else if (f.dataset.form === 'acctSignIn') { const d = new FormData(f); acctDo(() => VWSCloud.signInEmail(String(d.get('email') || '').trim(), String(d.get('password') || ''))); }
@@ -1841,21 +1932,19 @@
     if (restored) { session = restored; persistSession(); } else Prefs.remove('active');
     setupAudio();
     rebuildQueue();
-    $('#loading').remove();
-    show(Prefs.get('tab', 'home'));
-    if (session) {
-      openOverlay();
-      if (session.restoredPaused) { toast('Session restored. Your timer is paused at ' + C.fmtClock(session.accumMs / 1000) + '. Tap RESUME when you are ready.'); delete session.restoredPaused; persistSession(); }
-    }
-    if (DB.memory) toast('Browser storage is unavailable, so data will not be saved.');
+    // Phase 1: the dashboard is NOT shown here any more. revealDashboard() runs it after Firebase confirms a signed-in user.
     registerSW();
     initAccount();
     snapshotAfterUpgrade();
+    if (!window.VWSSync || !window.VWSCloud) setGate('error', { kind: 'missing' });
+    else if (!VWSCloud.configured) setGate('error', { kind: 'unconfigured' });
+    else if (!Gate.resolved) gateWatch();
   }
   /* ---- R2: the on-phone database is newer than this copy of the app ---- */
   function showNewerVersionNeeded() {
-    const l = $('#loading'); if (!l) return;
-    l.className = 'loading newer-needed';
+    const l = gateEl(); if (!l) return;
+    document.body.classList.add('gated'); l.hidden = false; Gate.state = 'newer';
+    l.className = 'gate newer-needed';
     l.innerHTML = '<div class="acct-box" style="max-width:420px;margin:24px auto;text-align:left"><h3 style="margin:0 0 8px">A newer version of the app is needed</h3>' +
       '<p>Your saved data on this phone was created by a newer version of Vishesh Workout Studio than the one that is open now. ' +
       'To keep your data safe, this version has <b>not opened it and has not changed anything</b>.</p>' +
@@ -1916,6 +2005,6 @@
   }
   boot().catch(e => {
     console.error(e);
-    const l = $('#loading'); if (l) l.textContent = 'Something went wrong while starting the app. Try reloading the page.';
+    setGate('error', { kind: 'boot' });
   });
 })();
