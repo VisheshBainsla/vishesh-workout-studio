@@ -6,7 +6,7 @@
  * changed sw.js, downloads all files fresh into a NEW cache, and the app offers an "Update now" button.
  * The old version keeps working until you tap it, so an update can never break a running workout.
  */
-const VERSION = '2026-11-18-v1';
+const VERSION = '2026-11-25-v1';
 const CACHE = 'vws-' + VERSION;
 const SDK_CACHE = 'sdk-firebase-v1';   // deliberately not prefixed 'vws-' so app updates keep it
 const SHELL = ['./', './index.html', './styles.css', './core.js', './firebase-config.js', './sync.js', './cloud.js', './app.js', './manifest.webmanifest', './icon-192.png', './icon-512.png'];

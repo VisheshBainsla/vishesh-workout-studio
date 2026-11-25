@@ -211,7 +211,7 @@
   const longDate = s => C.fromDateStr(s).toLocaleDateString('en-IN', { weekday: 'long', day: 'numeric', month: 'long' });
   const shortDate = s => C.fromDateStr(s).toLocaleDateString('en-IN', { day: 'numeric', month: 'short' });
   const timeOfDay = ms => new Date(ms).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' });
-  const cleanName = n => String(n).replace(/\.[A-Za-z0-9]{2,5}$/, '');
+  const nameClean = n => String(n).replace(/\.[A-Za-z0-9]{2,5}$/, '');
   const fmtSize = b => b >= 1048576 ? (b / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(b / 1024)) + ' KB';
 
   /* ---------------- navigation ---------------- */
@@ -249,6 +249,11 @@
     }).join('') + '</div>';
   }
 
+  // Dashboard greeting name: the signed-in account's own name (Firebase Auth displayName = signup name or Google name). Never a hardcoded or previous user's name.
+  // Order: 1) Firebase Auth displayName  2) the name already saved in this same account's Firestore profile (users/{uid}.displayName)  3) "User".
+  const personName = v => String(typeof v === 'string' ? v : '').replace(/\s+/g, ' ').trim();
+  const profFor = () => (Acct.user && Acct.prof && Acct.prof.uid === Acct.user.uid) ? Acct.prof : null;   // only ever this account's own profile
+  function greetName() { const pf = profFor(); return personName(Acct.user && Acct.user.displayName) || (pf && pf.name) || 'User'; }
   function renderHome() {
     const today = todayStr(), by = C.totalsByDate(S.sessions), tod = by[today] || { sec: 0, count: 0 };
     const wk = C.weekTotals(by, today), rs = restSet();
@@ -271,7 +276,7 @@
     $('#view-home').innerHTML =
       (DB.memory ? '<div class="banner"><b>Storage unavailable.</b> Your browser is blocking local storage, so data will be lost when you close this page. Export a backup before leaving (Settings, top right).</div>' : '') +
       (session ? '<div class="card live"><div><span class="dot"></span>Session ' + stateShort() + '<br><b>' + esc(session.title) + '</b> · <span class="js-live-time">' + C.fmtClock(C.sessionElapsedMs(session, Date.now()) / 1000) + '</span></div><button class="btn btn-primary btn-sm" data-action="resumeSession">Open</button></div>' : '') +
-      '<p class="eyebrow">' + greet + ', Vishesh</p><h1 class="page-title" style="margin:2px 0 14px">Today\'s Workout</h1>' +
+      '<p class="eyebrow">' + greet + ', ' + esc(greetName()) + '</p><h1 class="page-title" style="margin:2px 0 14px">Today\'s Workout</h1>' +
       '<div class="card"><div class="hero"><div class="ring-wrap"><svg width="132" height="132" viewBox="0 0 132 132"><circle class="ring-bg" cx="66" cy="66" r="' + R + '" fill="none" stroke-width="12"/><circle class="ring-fg" cx="66" cy="66" r="' + R + '" fill="none" stroke-width="12" stroke-linecap="round" stroke-dasharray="' + CIRC.toFixed(1) + '" stroke-dashoffset="' + (CIRC * (1 - pct)).toFixed(1) + '"/></svg>' +
       '<div class="ring-center"><div><b>' + Math.round(tod.sec / 60) + '</b><br><span>of ' + goal + ' min</span></div></div></div>' +
       '<div class="stack" style="gap:8px"><span class="pill ' + status.c + '">' + (status.c === 'ok' ? icon('check', 14) : status.c === 'rest' ? icon('moon', 14) : '') + status.t + '</span>' +
@@ -745,7 +750,7 @@
     Player.audio.src = Player.url;
     Player.currentId = id;
     if (Player.queue.indexOf(id) === -1) rebuildQueue(); else Player.qi = Player.queue.indexOf(id);
-    if ('mediaSession' in navigator && window.MediaMetadata) { try { navigator.mediaSession.metadata = new window.MediaMetadata({ title: cleanName(t.name), artist: 'Vishesh Workout Studio' }); } catch (e) { /* ignore */ } }
+    if ('mediaSession' in navigator && window.MediaMetadata) { try { navigator.mediaSession.metadata = new window.MediaMetadata({ title: nameClean(t.name), artist: 'Vishesh Workout Studio' }); } catch (e) { /* ignore */ } }
     if (ui.tab === 'music') renderMusic();
     updatePlayerUI();
     if (autoplay) { try { await Player.audio.play(); } catch (e) { if (e && e.name !== 'AbortError') toast('Tap play to start the song'); } }
@@ -782,7 +787,7 @@
   }
   function updatePlayerUI() {
     const a = Player.audio, t = S.tracks.find(x => x.id === Player.currentId);
-    $$('.js-np-title').forEach(el => { el.textContent = t ? cleanName(t.name) : 'Nothing playing'; });
+    $$('.js-np-title').forEach(el => { el.textContent = t ? nameClean(t.name) : 'Nothing playing'; });
     const st = a.paused ? 'play' : 'pause';
     $$('.js-play').forEach(el => { if (el.dataset.st !== st) { el.dataset.st = st; el.innerHTML = icon(st, el.classList.contains('big') ? 32 : 24); el.setAttribute('aria-label', st === 'play' ? 'Play' : 'Pause'); } });
     const seek = $('#seek');
@@ -851,7 +856,7 @@
       '<label class="checkrow"><input type="checkbox" id="keepFiles" ' + (keep ? 'checked' : '') + '><span>Keep a copy of the songs inside this browser so they are ready next time. Uses phone storage and stays on this device only.</span></label>' +
       (missing ? '<div class="banner" style="margin:6px 0 0"><b>' + missing + ' song' + (missing === 1 ? ' needs' : 's need') + ' to be reselected.</b> Browsers cannot remember files from your phone by themselves. Tap “Add / reselect songs” and choose the same files again; they are matched by name and size.</div>' : '') + '</div>' +
       '<div class="card"><div class="row between"><div class="card-title" style="margin:0">Playlist (' + list.length + ')</div>' + (list.length ? '<button class="btn btn-ghost btn-sm" data-action="clearPlaylist">Clear</button>' : '') + '</div>' +
-      (list.length ? list.map(t => '<div class="track ' + (t.id === Player.currentId ? 'cur' : '') + (playable(t) ? '' : ' off') + '"><button class="track-main" data-action="playTrack" data-id="' + esc(t.id) + '"><span class="track-name">' + esc(cleanName(t.name)) + '</span><small>' + fmtSize(t.size) + (playable(t) ? '' : ' · reselect file to play') + '</small></button>' +
+      (list.length ? list.map(t => '<div class="track ' + (t.id === Player.currentId ? 'cur' : '') + (playable(t) ? '' : ' off') + '"><button class="track-main" data-action="playTrack" data-id="' + esc(t.id) + '"><span class="track-name">' + esc(nameClean(t.name)) + '</span><small>' + fmtSize(t.size) + (playable(t) ? '' : ' · reselect file to play') + '</small></button>' +
         '<button class="btn btn-ghost btn-icon" data-action="removeTrack" data-id="' + esc(t.id) + '" aria-label="Remove song">' + icon('x', 18) + '</button></div>').join('') : '<p class="muted" style="margin-top:12px">No songs yet. Tap “Add / reselect songs” to pick music from your phone.</p>') + '</div>';
   }
 
@@ -1636,8 +1641,10 @@
   }
   function saveProfileQuiet() {
     if (!Acct.engine || !Acct.engine.cloud || !Acct.user || !Acct.engine.cloud.saveProfile) return;
-    const goal = Prefs.get('goalMin', null);
-    Acct.engine.cloud.saveProfile({ displayName: acctName(), email: Acct.user.email, goalMin: typeof goal === 'number' ? goal : undefined }).catch(e => console.warn('Profile not saved yet', e));
+    const goal = Prefs.get('goalMin', null), pf = profFor();
+    const nm = acctName() || (pf && pf.name) || '';
+    if (!nm && pf && !pf.done) return;   // the saved profile name is not known yet: do not risk overwriting it with an empty one
+    Acct.engine.cloud.saveProfile({ displayName: nm, email: Acct.user.email, goalMin: typeof goal === 'number' ? goal : undefined }).catch(e => console.warn('Profile not saved yet', e));
   }
   async function restoreGoalFromProfile() {
     try {
@@ -1646,9 +1653,22 @@
       if (p && typeof p.goalMin === 'number' && p.goalMin >= 5 && p.goalMin <= 600) { Prefs.set('goalMin', p.goalMin); rerender(); }
     } catch (e) { /* optional */ }
   }
+  // Only when Auth has no name: read the name already saved in this account's own profile (read-only; nothing is written or created).
+  async function loadProfileName(user) {
+    Acct.prof = null;
+    if (personName(user.displayName) || !Acct.engine || !Acct.engine.cloud || !Acct.engine.cloud.getProfile) return;
+    const pf = Acct.prof = { uid: user.uid, name: '', done: false };
+    const get = Acct.engine.cloud.getProfile().then(p => {
+      if (Acct.prof !== pf) return;                       // account changed / signed out meanwhile: ignore
+      pf.name = personName(p && p.displayName); pf.done = true;
+      if (pf.name && Gate.dash && ui.tab === 'home') rerender();
+    }).catch(() => {});
+    await Promise.race([get, new Promise(r => setTimeout(r, 4000))]);
+  }
   async function onAuthUser(user) {
     if (!user) {
-      Acct.user = null; Prefs.remove('acct'); Acct.paused = false; Acct.compare = null;
+      Acct.user = null; Acct.prof = null; Prefs.remove('acct'); Acct.paused = false; Acct.compare = null;
+      { const hv = $('#view-home'); if (hv) hv.innerHTML = ''; }   // drop the previous account's greeting from the page
       if (Acct.engine) Acct.engine.detach();
       updateChip(); if (acctOpen()) renderAccount();
       return;
@@ -1657,6 +1677,8 @@
     Acct.user = user; Prefs.set('acct', { uid: user.uid, email: user.email, displayName: user.displayName });
     Acct.engine.attach(VWSCloud.makeCloud(user.uid), user.uid);
     updateChip();
+    if (Gate.dash && ui.tab === 'home') rerender();
+    await loadProfileName(user);
     await resolveOwner(user);
     if (acctOpen()) renderAccount();
   }
@@ -1871,12 +1893,12 @@
       const d = new FormData(f), name = String(d.get('name') || '').trim(), em = String(d.get('email') || '').trim(), pw = String(d.get('password') || '');
       if (!name) { Acct.msg = 'Please enter your name.'; Acct.msgOk = false; renderAccount(); return; }
       Acct.pendingName = name;
-      acctDo(async () => { const u = await VWSCloud.signUpEmail(name, em, pw); if (Acct.user && !Acct.user.displayName) { Acct.user.displayName = name; Prefs.set('acct', { uid: Acct.user.uid, email: Acct.user.email, displayName: name }); } saveProfileQuiet(); });
+      acctDo(async () => { const u = await VWSCloud.signUpEmail(name, em, pw); if (Acct.user && !Acct.user.displayName) { Acct.user.displayName = name; Prefs.set('acct', { uid: Acct.user.uid, email: Acct.user.email, displayName: name }); } saveProfileQuiet(); if (ui.tab === 'home') rerender(); });
     }
     else if (f.dataset.form === 'acctName') {
       const nm = String(new FormData(f).get('name') || '').trim();
       if (!nm) { toast('Name cannot be empty'); return; }
-      acctDo(async () => { const u = await VWSCloud.updateName(nm); Acct.user.displayName = u.displayName; Prefs.set('acct', { uid: Acct.user.uid, email: Acct.user.email, displayName: u.displayName }); saveProfileQuiet(); Acct.msg = 'Name saved.'; Acct.msgOk = true; });
+      acctDo(async () => { const u = await VWSCloud.updateName(nm); Acct.user.displayName = u.displayName; Prefs.set('acct', { uid: Acct.user.uid, email: Acct.user.email, displayName: u.displayName }); saveProfileQuiet(); if (ui.tab === 'home') rerender(); Acct.msg = 'Name saved.'; Acct.msgOk = true; });
     }
     else if (f.dataset.form === 'importVideo') runImport(f);
     else if (f.dataset.form === 'renameVideo') saveRename(f);
