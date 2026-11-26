@@ -395,3 +395,121 @@ body:not(.gated) #gate { display: none !important; }
 @keyframes gate-spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { .gate-spinner { animation-duration: 2.4s; } }
 .gate.newer-needed .acct-box { margin: 0; }
+
+/* =====================================================================================================
+ * Phase 2 — tablet and desktop/laptop layout. CSS ONLY: nothing below applies under 700px wide, so the phone layout
+ * and its bottom navigation are exactly as before. The existing breakpoint was only max-width:360px (small phones).
+ *   700px+   tablet : bottom navigation kept, wider content column, two-column grids
+ *   900px+   tablet landscape : Music and Tracker use two columns
+ *   1024px+  laptop/desktop : left sidebar navigation (replaces the bottom bar), wide content area
+ *   1280px+  large screens : Home uses three columns
+ * The views are rendered by app.js as flat lists of cards, so cards are placed with :nth-last-child (the last
+ * cards of each view are always the same ones); everything else (title, banners, live-session card) spans the full row.
+ * ===================================================================================================== */
+@media (min-width: 700px) {
+  .topbar, .bottom-nav { max-width: 920px; }
+  #app { max-width: 920px; padding-left: 24px; padding-right: 24px; }
+  .update-banner { max-width: 600px; }
+
+  /* every view becomes a responsive grid; headers, banners and notices always take the full row */
+  .view.active { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; align-items: stretch; grid-auto-flow: row dense; }
+  .view.active > * { margin-bottom: 0; min-width: 0; }
+  .view.active > .card { margin-bottom: 0; }
+  .view .grid2 > .card { margin-bottom: 0; }
+  .view.active > .page-head, .view.active > .eyebrow, .view.active > .page-title, .view.active > .banner, .view.active > .card.live,
+  .view.active > .seg, .view.active > .chips, .view.active > .btn-block, .view.active > .card.empty, .view.active > #vid-storage { grid-column: 1 / -1; }
+  .view.active > .seg { max-width: 440px; width: 100%; }
+  .view.active > .btn-block { justify-self: start; width: 100%; max-width: 440px; }
+  .view.active > .card.live { margin-bottom: 0; }
+  .view.active > .page-title { margin-bottom: 0 !important; }
+  .view.active > .eyebrow { margin-bottom: -10px; }
+  .view.active > .chips { margin-bottom: 0; }
+
+  /* Home: Today's Workout is the primary (widest) card, Streak beside it, week + totals below */
+  #view-home.active > :nth-last-child(4) { grid-column: 1 / -1; }                 /* Today's Workout */
+  #view-home.active > :nth-last-child(2) { grid-column: 1 / -1; }                 /* This week */
+  #view-home.active > :nth-last-child(3), #view-home.active > :last-child { display: flex; flex-direction: column; }   /* Streak, Totals */
+  #view-home.active > :nth-last-child(3) .streak { flex: 1; justify-content: center; gap: 18px; }
+  #view-home.active > :nth-last-child(3) .streak b { font-size: 52px; }
+  #view-home.active > :last-child .grid3 { flex: 1; align-content: center; }
+  #view-home .stat { padding: 12px 6px; }
+  #view-home .stat b { white-space: nowrap; font-size: clamp(16px, 1.6vw, 20px); }   /* "3h 52m" never wraps in the narrower cards */
+  #view-home .hero { gap: 28px; }
+  #view-home .ring-wrap { width: 148px; height: 148px; }
+  #view-home .ring-wrap svg { width: 148px; height: 148px; }
+  #view-home .bars { height: 170px; }
+
+  /* Workouts: responsive card grid */
+  #view-workouts.active { grid-template-columns: repeat(auto-fill, minmax(290px, 1fr)); }
+  #view-workouts .wcard { display: flex; flex-direction: column; }
+  #view-workouts .wbody { flex: 1; display: flex; flex-direction: column; }
+  #view-workouts .wbody .actions { margin-top: auto; padding-top: 14px; }
+
+  /* Progress: weight entry + chart beside weekly activity, history across the full width */
+  #view-progress.active { grid-template-rows: auto auto 1fr; align-items: start; }
+  #view-progress.active > .page-head { grid-row: 1; }
+  #view-progress.active > :nth-last-child(3) { grid-column: 1; grid-row: 2 / span 2; }   /* Body weight: entry, chart, entries */
+  #view-progress.active > :nth-last-child(2) { grid-column: 2; grid-row: 2; }           /* Weekly activity + totals */
+  #view-progress.active > :last-child { grid-column: 2; grid-row: 3; }                  /* Workout history */
+  #view-progress .bars.tall { height: 190px; }
+  #view-progress .hist-item { padding: 12px 0; }
+
+  /* Music and Tracker stay one column until 900px (two columns there) */
+  #view-music.active, #view-tracker.active { grid-template-columns: minmax(0, 1fr); }
+  #view-tracker .day { height: 48px; }
+}
+
+@media (min-width: 900px) {
+  /* Music: player and controls on the left, the playlist beside them */
+  #view-music.active { grid-template-columns: minmax(0, 420px) minmax(0, 1fr); }
+  #view-music.active { grid-template-rows: auto auto auto 1fr; align-items: start; }
+  #view-music.active > .page-head { grid-row: 1; }
+  #view-music.active > .banner { grid-row: 2; }
+  #view-music.active > :nth-last-child(3) { grid-column: 1; grid-row: 3; }      /* Now playing */
+  #view-music.active > :nth-last-child(2) { grid-column: 1; grid-row: 4; }      /* Add / reselect songs */
+  #view-music.active > :last-child { grid-column: 2; grid-row: 3 / span 2; }    /* Playlist */
+  /* Tracker: calendar on the left, streaks / selected day / totals on the right */
+  #view-tracker.active { grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr); grid-template-rows: auto auto auto 1fr; align-items: start; }
+  #view-tracker.active > .page-head { grid-row: 1; }
+  #view-tracker.active > :nth-last-child(4) { grid-column: 2; grid-row: 2; }    /* Current / longest streak */
+  #view-tracker.active > :nth-last-child(3) { grid-column: 1; grid-row: 2 / span 3; }   /* Calendar */
+  #view-tracker.active > :nth-last-child(2) { grid-column: 2; grid-row: 3; }    /* Selected day */
+  #view-tracker.active > :last-child { grid-column: 2; grid-row: 4; }           /* Totals */
+  #view-tracker .day { height: 54px; font-size: 15px; }
+}
+
+/* ---------- laptop / desktop: fixed left sidebar ---------- */
+@media (min-width: 1024px) {
+  :root { --side-w: 248px; }
+  /* sidebar = the existing #nav element (same buttons, same labels and icons, same click handling) */
+  .bottom-nav {
+    left: 0; right: auto; top: 0; bottom: 0; margin: 0; width: var(--side-w); max-width: none; height: auto; z-index: 15;
+    display: flex; flex-direction: column; align-items: stretch; justify-content: flex-start; gap: 6px;
+    padding: 96px 14px 24px; overflow-y: auto;
+    background: rgba(10, 10, 11, .96); backdrop-filter: none; border-top: 0; border-right: 1px solid #1f1f22;
+  }
+  .bottom-nav button {
+    flex-direction: row; justify-content: flex-start; gap: 14px; min-height: 52px; padding: 0 16px; border-radius: 14px;
+    font-size: 15px; letter-spacing: .3px; text-align: left; border: 1px solid transparent;
+  }
+  .bottom-nav button:hover { background: #151516; color: var(--text); }
+  .bottom-nav button:focus-visible { outline: 2px solid var(--red2); outline-offset: 2px; }
+  .bottom-nav button.active { color: var(--red2); background: rgba(225, 29, 46, .12); border-color: #4a1a20; }
+  .bottom-nav button.active:hover { color: var(--red2); }
+  .bottom-nav button.active::before { top: 50%; left: -14px; width: 4px; height: 26px; margin-top: -13px; border-radius: 0 4px 4px 0; }
+  .bottom-nav button span { font-size: 15px; }
+
+  /* the existing logo/brand stays on screen at the top of the sidebar; the top bar keeps only sync chip + settings */
+  .topbar { max-width: none; margin: 0 0 0 var(--side-w); padding: 14px 32px; justify-content: flex-end; backdrop-filter: none; background: rgba(7, 7, 7, .9); }
+  .topbar .brand { position: fixed; left: 24px; top: 20px; z-index: 5; }
+  #app { max-width: none; margin: 0 0 0 var(--side-w); padding: 24px 32px 48px; }
+  .view.active { max-width: 1240px; margin-left: auto; margin-right: auto; }
+  .update-banner { left: calc(var(--side-w) + 12px); max-width: 600px; }
+  #toast { left: calc(50% + var(--side-w) / 2); bottom: 24px; }
+  .page-title { font-size: 30px; }
+}
+
+@media (min-width: 1280px) {
+  #view-home.active { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  #view-home.active > :nth-last-child(4), #view-home.active > :nth-last-child(2) { grid-column: span 2; }   /* Today + week are wide; Streak + totals sit beside them */
+}
